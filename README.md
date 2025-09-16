@@ -3,9 +3,13 @@
 
 ## Installation:
 1. In VRChat: Make sure **"Debug" logging** in Settings is set to **"Full"**.
+2. 
+   
 <img width="1157" height="647" alt="image" src="https://github.com/user-attachments/assets/d71a03c5-4cac-48e3-aa74-b618e294f0d8" />
 
-2. Run the provided .exe to start the program! I suggest pinning it to your taskbar.
+
+
+3. Run the provided .exe to start the program! I suggest pinning it to your taskbar.
 
 ## Instructions:
 [Mostly self explanatory. Full instructions coming when tool is in a more complete state.]
