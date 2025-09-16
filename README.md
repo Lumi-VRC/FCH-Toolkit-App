@@ -1,7 +1,8 @@
-# Tauri + SvelteKit
+# FCH Toolkit Companion App
 
-This template should help get you started developing with Tauri and SvelteKit in Vite.
 
-## Recommended IDE Setup
+## Instructions:
+1. In VRChat: Make sure **"Debug" logging** in Settings is set to **"Full"**.
+<img width="1157" height="647" alt="image" src="https://github.com/user-attachments/assets/d71a03c5-4cac-48e3-aa74-b618e294f0d8" />
 
-[VS Code](https://code.visualstudio.com/) + [Svelte](https://marketplace.visualstudio.com/items?itemName=svelte.svelte-vscode) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer).
+2. 
