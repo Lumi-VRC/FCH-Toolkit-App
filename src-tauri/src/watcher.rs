@@ -13,16 +13,11 @@ use tauri::Emitter; // brings .emit() for sending events to the front-end
 macro_rules! debug_log { ($($t:tt)*) => {{}} }
 
 // Start the background log watcher. This is invoked by the front-end when the
-// Instance Monitor screen is opened. It immediately purges any stale "open"
-// rows (from previous crashes) and then spawns the tail loop.
+// Instance Monitor screen is opened. We no longer purge previously "open"
+// rows on startup; backfill from the latest instance join reconstructs state.
 #[tauri::command]
 pub async fn start_log_watcher(app_handle: tauri::AppHandle) -> Result<(), String> {
 	debug_log!("[watcher] start requested");
-	// Close any stale open joins from previous sessions so the UI won't show
-	// orphaned users after a crash or forced termination. We use the current
-	// local timestamp to mark the "left" time.
-	let ts = chrono::Local::now().format("%Y.%m.%d %H:%M:%S").to_string();
-	let _ = super::db::db_purge_all(&app_handle, &ts, false);
 	// Run the tail loop on a background task so the Tauri thread remains free.
 	tokio::spawn(async move {
 		debug_log!("[watcher] task spawned");

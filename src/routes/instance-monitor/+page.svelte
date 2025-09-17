@@ -229,7 +229,7 @@
 <div class="panel">
   <div class="header">
     <div class="tabs">
-      <button aria-label="Instance Logs" class:active={tab==='monitor'} title="Instance Logs" onclick={() => tab='monitor'}>Instance Logs</button>
+      <button aria-label="Live View" class:active={tab==='monitor'} title="Live View" onclick={() => tab='monitor'}>Live View</button>
       <button aria-label="Join Logs" class:active={tab==='logs'} title="Join Logs" onclick={showJoinLogs}>Join Logs</button>
     </div>
     <div class="meta">{activeUsers.length} user{s(activeUsers.length)} in instance</div>

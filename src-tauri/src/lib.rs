@@ -28,17 +28,7 @@ pub fn run() {
 		.manage(watcher::SearchState(Arc::new(Mutex::new(0))))
 		// Small helper plugin that opens URLs/files using the OS.
 		.plugin(tauri_plugin_opener::init())
-		// Updater plugin: checks for updates and installs them (front-end triggers it).
-		.plugin(tauri_plugin_updater::Builder::new().build())
-		// When the main window is about to close, mark any open joins as 'left'.
-		.on_window_event(|app, event| {
-			if let tauri::WindowEvent::CloseRequested { .. } = event {
-				// Timestamp format matches VRChat logs (YYYY.MM.DD HH:MM:SS)
-				let ts = chrono::Local::now().format("%Y.%m.%d %H:%M:%S").to_string();
-				// Best-effort: if this fails, startup will also purge on next launch.
-				let _ = db::db_purge_all(&app.app_handle(), &ts, true);
-			}
-		})
+		
 		// Register Rust commands callable from the Svelte front-end via invoke(...)
 		.invoke_handler(tauri::generate_handler![
 			// Example/template
