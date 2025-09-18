@@ -9,7 +9,6 @@ mod db;
 mod watcher;
 
 use std::sync::{Arc, Mutex};
-use tauri::Manager; // brings .app_handle() and other manager helpers into scope
 
 #[tauri::command]
 fn greet(name: &str) -> String {
