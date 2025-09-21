@@ -32,6 +32,7 @@
 //   key    TEXT PRIMARY KEY
 //   value  TEXT NOT NULL
 use std::path::PathBuf;
+use std::fs;
 use anyhow::Result;
 use tauri::Emitter;
 
@@ -41,6 +42,8 @@ fn db_path() -> PathBuf { super::notes::notes_dir().join("joinlogs.db") }
 // Create tables and add missing columns. Safe to call repeatedly, here because I kept having to remake the db manually.
 pub fn db_init() -> rusqlite::Result<()> {
 	let p = db_path();
+    // Ensure the parent directory exists on first run (same folder as notes/config)
+    let _ = fs::create_dir_all(super::notes::notes_dir());
 	let conn = rusqlite::Connection::open(p)?;
 	// Primary table: join rows and system rows live together, distinguished by
 	// is_system (0 for players, 1 for system). We store join and optional leave
@@ -62,11 +65,21 @@ pub fn db_init() -> rusqlite::Result<()> {
 	let _ = conn.execute("ALTER TABLE join_log ADD COLUMN world_id TEXT", []);
 	let _ = conn.execute("ALTER TABLE join_log ADD COLUMN instance_id TEXT", []);
 	let _ = conn.execute("ALTER TABLE join_log ADD COLUMN region TEXT", []);
+	// Group watchlisted flag to persist historical matches for UI backfill
+	let _ = conn.execute("ALTER TABLE join_log ADD COLUMN group_watchlisted INTEGER NOT NULL DEFAULT 0", []);
 	// Lightweight state store for miscellaneous app/session values
 	conn.execute_batch(
 		"CREATE TABLE IF NOT EXISTS app_state (
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
+		);"
+	)?;
+	// Access tokens for groups (persisted between restarts)
+	conn.execute_batch(
+		"CREATE TABLE IF NOT EXISTS group_access (
+			group_id TEXT PRIMARY KEY,
+			group_name TEXT NOT NULL,
+			access_token TEXT NOT NULL
 		);"
 	)?;
 	Ok(())
@@ -125,7 +138,7 @@ pub fn db_insert_join(app: &tauri::AppHandle, ts: &str, user_id: &str, username:
 	if ts.is_empty() || user_id.is_empty() { return Ok(()); }
 	db_init()?;
 	let conn = rusqlite::Connection::open(db_path())?;
-	let mut stmt = conn.prepare("INSERT OR IGNORE INTO join_log (user_id, username, join_timestamp, is_system, event_kind) VALUES (?, ?, ?, 0, 'join')")?;
+    let mut stmt = conn.prepare("INSERT OR IGNORE INTO join_log (user_id, username, join_timestamp, is_system, event_kind) VALUES (?, ?, ?, 0, 'join')")?;
 	let changed = stmt.execute(rusqlite::params![user_id, username, ts])?;
 	let id = conn.last_insert_rowid();
 
@@ -136,6 +149,7 @@ pub fn db_insert_join(app: &tauri::AppHandle, ts: &str, user_id: &str, username:
 			"username": username,
 			"joinedAt": ts,
 			"leftAt": serde_json::Value::Null,
+            "groupWatchlisted": serde_json::Value::Null,
 		});
 		app.emit("db_row_inserted", payload)?;
 	}
@@ -203,6 +217,57 @@ pub fn db_purge_all(app: &tauri::AppHandle, ts: &str, emit: bool) -> Result<()> 
 	Ok(())
 }
 
+// Close duplicate open joins per user, keeping only the latest open row
+#[tauri::command]
+pub fn dedupe_open_joins(app: tauri::AppHandle) -> Result<usize, String> {
+    db_init().map_err(|e| e.to_string())?;
+    let conn = rusqlite::Connection::open(db_path()).map_err(|e| e.to_string())?;
+    // Find users with multiple open rows
+    let mut stmt = conn.prepare("SELECT user_id FROM join_log WHERE leave_timestamp IS NULL AND is_system = 0 GROUP BY user_id HAVING COUNT(*) > 1").map_err(|e| e.to_string())?;
+    let user_ids = stmt.query_map([], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+    let mut total_closed = 0usize;
+    // Get a reasonable timestamp to mark older rows closed
+    let ts = super::db::db_get_state("last_instance_join_ts").unwrap_or(None).unwrap_or_else(|| chrono::Local::now().format("%Y.%m.%d %H:%M:%S").to_string());
+    for uid_res in user_ids {
+        let uid = match uid_res { Ok(u) => u, Err(_) => continue };
+        let mut q = conn.prepare("SELECT id, join_timestamp FROM join_log WHERE user_id = ?1 AND leave_timestamp IS NULL AND is_system = 0 ORDER BY join_timestamp DESC").map_err(|e| e.to_string())?;
+        let rows = q.query_map(rusqlite::params![&uid], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))).map_err(|e| e.to_string())?;
+        let mut to_close: Vec<i64> = Vec::new();
+        for (idx, r) in rows.enumerate() {
+            if let Ok((id, _jt)) = r {
+                if idx > 0 { to_close.push(id); }
+            }
+        }
+        for id in to_close {
+            let _ = conn.execute("UPDATE join_log SET leave_timestamp = ?1 WHERE id = ?2", rusqlite::params![&ts, id]);
+            total_closed += 1;
+            let _ = app.emit("db_row_updated", serde_json::json!({ "id": id, "userId": uid, "leftAt": ts }));
+        }
+    }
+    Ok(total_closed)
+}
+
+// Persist group_watchlisted flag for all rows of given users in current instance window
+#[tauri::command]
+pub fn set_group_watchlisted_for_users(user_ids: Vec<String>) -> Result<usize, String> {
+    if user_ids.is_empty() { return Ok(0); }
+    db_init().map_err(|e| e.to_string())?;
+    let conn = rusqlite::Connection::open(db_path()).map_err(|e| e.to_string())?;
+    let since = super::db::db_get_state("last_instance_join_ts").unwrap_or(None);
+    let placeholders = (0..user_ids.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = if let Some(ref ts) = since {
+        format!("UPDATE join_log SET group_watchlisted = 1 WHERE is_system = 0 AND user_id IN ({}) AND join_timestamp >= ?", placeholders)
+    } else {
+        format!("UPDATE join_log SET group_watchlisted = 1 WHERE is_system = 0 AND user_id IN ({})", placeholders)
+    };
+    let mut params: Vec<&dyn rusqlite::ToSql> = user_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    if let Some(ref ts) = since {
+        params.push(ts);
+    }
+    let changed = conn.execute(&sql, params.as_slice()).map_err(|e| e.to_string())? as usize;
+    Ok(changed)
+}
+
 // Return a page of rows ordered by newest join first (includes system rows)
 // I tried really hard to better paginate this but I'm failing miserably
 // I need to figure out how to pre-load the next page without lagging the front end, but also without using tiny pages.
@@ -211,7 +276,7 @@ pub fn db_purge_all(app: &tauri::AppHandle, ts: &str, emit: bool) -> Result<()> 
 pub fn get_join_logs_page(offset: i64, limit: i64) -> Result<Vec<serde_json::Value>, String> {
 	db_init().map_err(|e| e.to_string())?;
 	let conn = rusqlite::Connection::open(db_path()).map_err(|e| e.to_string())?;
-	let mut stmt = conn.prepare("SELECT id, user_id, username, join_timestamp, leave_timestamp, is_system, event_kind, message, world_id, instance_id, region FROM join_log ORDER BY join_timestamp DESC LIMIT ?2 OFFSET ?1").map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare("SELECT id, user_id, username, join_timestamp, leave_timestamp, is_system, event_kind, message, world_id, instance_id, region, group_watchlisted FROM join_log ORDER BY join_timestamp DESC LIMIT ?2 OFFSET ?1").map_err(|e| e.to_string())?;
 	let rows = stmt.query_map(rusqlite::params![offset, limit], |row| {
 		// Yeah this is super ugly and I had to google how to do this.
 		// I've never messed with pagination in a local app before, just web pages... Managing lag is harder than expected.
@@ -229,11 +294,54 @@ pub fn get_join_logs_page(offset: i64, limit: i64) -> Result<Vec<serde_json::Val
 			"worldId": row.get::<_, Option<String>>(8)?,
 			"instanceId": row.get::<_, Option<String>>(9)?,
 			"region": row.get::<_, Option<String>>(10)?,
+			"groupWatchlisted": row.get::<_, Option<i64>>(11)?.unwrap_or(0) == 1,
 		}))
 	}).map_err(|e| e.to_string())?;
 	let mut out = Vec::new(); for r in rows { out.push(r.map_err(|e| e.to_string())?); }
 	Ok(out)
 	// OK :DD
+}
+
+// --- Group access token storage ---
+
+#[tauri::command]
+pub fn add_group_access_token(group_id: String, group_name: String, token: String) -> Result<(), String> {
+    if group_id.trim().is_empty() || token.trim().is_empty() { return Err("Missing group or token".into()); }
+    db_init().map_err(|e| e.to_string())?;
+    let conn = rusqlite::Connection::open(db_path()).map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT OR REPLACE INTO group_access (group_id, group_name, access_token) VALUES (?1, ?2, ?3)",
+        rusqlite::params![group_id, group_name, token]
+    ).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn list_group_access_tokens() -> Result<Vec<serde_json::Value>, String> {
+    db_init().map_err(|e| e.to_string())?;
+    let conn = rusqlite::Connection::open(db_path()).map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare("SELECT group_id, group_name, access_token FROM group_access ORDER BY group_name ASC")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt.query_map([], |row| {
+        Ok(serde_json::json!({
+            "groupId": row.get::<_, String>(0)?,
+            "name": row.get::<_, String>(1)?,
+            "token": row.get::<_, String>(2)?,
+        }))
+    }).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for r in rows { out.push(r.map_err(|e| e.to_string())?); }
+    Ok(out)
+}
+
+#[tauri::command]
+pub fn remove_group_access_token(group_id: String) -> Result<(), String> {
+    if group_id.trim().is_empty() { return Ok(()); }
+    db_init().map_err(|e| e.to_string())?;
+    let conn = rusqlite::Connection::open(db_path()).map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM group_access WHERE group_id = ?1", rusqlite::params![group_id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 // Return currently active users (no leave_timestamp), filtered by session start

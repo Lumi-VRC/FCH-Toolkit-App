@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
 
-  type UserJoinLog = { id?: number; type: 'user'; userId: string; username?: string; joinedAt?: string; leftAt?: string };
+  type UserJoinLog = { id?: number; type: 'user'; userId: string; username?: string; joinedAt?: string; leftAt?: string; groupWatchlisted?: boolean };
   type SystemLog = { type: 'system'; ts?: string; message: string; worldId?: string; instanceId?: string; region?: string };
   type LogEntry = SystemLog | UserJoinLog;
 
@@ -20,6 +20,11 @@
   let noted = $state(new Map<string, boolean>());
   const loadingNotes = new Set<string>();
   let watch = $state(new Map<string, boolean>());
+  let watchFlags = $state(new Map<string, { watchlist: boolean; notes?: string }>());
+  let modAgg = $state(new Map<string, { warns: number; kicks: number; bans: number }>());
+  type GroupMatch = { group_id: string; groupName?: string; notes?: string; watchlist?: boolean };
+  let showWatchModal: { userId: string; items: GroupMatch[] } | null = $state(null);
+  let lastMatches = $state(new Map<string, GroupMatch[]>());
 
   async function handleDeleteClick() {
     if (!confirmingDelete) {
@@ -53,7 +58,7 @@
     if (l.isSystem || l.isSystem === true) {
       return { type: 'system', ts: l.joinedAt || l.ts, message: l.message || 'System', worldId: l.worldId, instanceId: l.instanceId, region: l.region } as SystemLog;
     }
-    return { type: 'user', id: l.id, userId: l.userId, username: l.username, joinedAt: l.joinedAt, leftAt: l.leftAt } as UserJoinLog;
+    return { type: 'user', id: l.id, userId: l.userId, username: l.username, joinedAt: l.joinedAt, leftAt: l.leftAt, groupWatchlisted: !!l.groupWatchlisted } as UserJoinLog;
   }
 
   async function fetchPage(page: number) {
@@ -77,6 +82,7 @@
         const has = !!(res && res.text && String(res.text).length > 0);
         noted.set(userId, has);
         noted = new Map(noted);
+        resortActiveUsers();
       } catch {}
       loadingNotes.delete(userId);
     })();
@@ -85,7 +91,7 @@
   function ensureWatchLoaded(userId: string) {
     if (!userId || watch.has(userId)) return;
     (async () => {
-      try { const res: any = await invoke('get_watch', { userId }); watch.set(userId, !!(res && res.watch)); watch = new Map(watch); } catch {}
+      try { const res: any = await invoke('get_watch', { userId }); watch.set(userId, !!(res && res.watch)); watch = new Map(watch); resortActiveUsers(); } catch {}
     })();
   }
 
@@ -116,6 +122,68 @@
     } catch {
       return s.slice(0, 1);
     }
+  }
+
+  // Consume group-watch results from global batcher (in +layout)
+  function applyGroupWatchResults(payload: { matches: any[]; aggregates: any[] }) {
+    try {
+      const w: any = window as any;
+      const cache = w.__FCH_GROUP_WATCH_CACHE__;
+      if (cache && cache.flags) {
+        const map = new Map<string, { watchlist: boolean; notes?: string }>();
+        for (const [uid, flag] of Object.entries<any>(cache.flags)) {
+          map.set(uid, { watchlist: Boolean(flag.watchlist), notes: flag.notes });
+        }
+        watchFlags = map;
+        // Also hydrate per-user matches for the modal
+        const perUser = new Map<string, GroupMatch[]>();
+        if (cache.matchesByUser) {
+          for (const [uid, arr] of Object.entries<any>(cache.matchesByUser)) {
+            const list: GroupMatch[] = Array.isArray(arr)
+              ? (arr as any[]).map((m) => ({
+                  group_id: String(m.group_id),
+                  groupName: m.groupName,
+                  notes: m.notes,
+                  watchlist: Boolean(m.watchlist)
+                }))
+              : [];
+            perUser.set(uid, list);
+          }
+        }
+        lastMatches = perUser;
+      } else {
+        const map = new Map<string, { watchlist: boolean; notes?: string }>();
+        const perUserMatches = new Map<string, GroupMatch[]>();
+        for (const m of (payload.matches || [])) {
+          const uid = String(m.user_id);
+          const watchlist = Boolean(m.watchlist);
+          const notes = m.notes ? String(m.notes) : undefined;
+          const prev = map.get(uid);
+          map.set(uid, { watchlist: (prev?.watchlist || watchlist), notes: prev?.notes || notes });
+          const arr = perUserMatches.get(uid) || [];
+          arr.push({ group_id: String(m.group_id), groupName: m.groupName, notes, watchlist });
+          perUserMatches.set(uid, arr);
+        }
+        watchFlags = map;
+        lastMatches = perUserMatches;
+      }
+      {
+        const w: any = window as any;
+        const cache = w.__FCH_GROUP_WATCH_CACHE__;
+        const aggMap = new Map<string, { warns: number; kicks: number; bans: number }>();
+        if (cache && cache.aggregates) {
+          for (const [uid, v] of Object.entries<any>(cache.aggregates)) {
+            aggMap.set(uid, { warns: Number(v.warns)||0, kicks: Number(v.kicks)||0, bans: Number(v.bans)||0 });
+          }
+        } else {
+          for (const a of (payload.aggregates || [])) {
+            aggMap.set(String(a.user_id), { warns: Number(a.warns)||0, kicks: Number(a.kicks)||0, bans: Number(a.bans)||0 });
+          }
+        }
+        modAgg = aggMap;
+      }
+      resortActiveUsers();
+    } catch {}
   }
 
   function filteredLogs(): LogEntry[] {
@@ -150,8 +218,40 @@
     });
   }
 
+  function resortActiveUsers() {
+    // Priority: any local note OR local watch OR group watchlisted => top
+    const score = (u: UserJoinLog): number => {
+      const hasLocalNote = noted.get(u.userId) === true;
+      const hasLocalWatch = watch.get(u.userId) === true;
+      const hasGroupFlag = watchFlags.has(u.userId);
+      return (hasLocalNote || hasLocalWatch || hasGroupFlag) ? 1 : 0;
+    };
+    activeUsers = [...activeUsers].sort((a, b) => {
+      const sb = score(b) - score(a);
+      if (sb !== 0) return sb;
+      // Stable-ish fallback: most recent join first if timestamps exist
+      const at = a.joinedAt || '';
+      const bt = b.joinedAt || '';
+      return bt.localeCompare(at);
+    });
+  }
+
   onMount(() => {
     const unsubs: Array<() => void> = [];
+    const handleGroupResults = (ev: any) => {
+      const d = ev?.detail;
+      if (!d) return;
+      applyGroupWatchResults({ matches: d.matches || [], aggregates: d.aggregates || [] });
+    };
+    window.addEventListener('group_watch_results', handleGroupResults as any);
+    (async () => {
+      try {
+        const { listen } = await import('@tauri-apps/api/event');
+        unsubs.push(await listen('sound_triggered', (e: any) => {
+          console.debug('[sound] local_watchlist(page)', e?.payload || {});
+        }));
+      } catch {}
+    })();
 
     (async () => {
       try { await invoke('start_log_watcher'); } catch(e) { console.error("Failed to start log watcher", e); }
@@ -164,8 +264,27 @@
         
         try {
           const initialActive: any[] = await invoke('get_active_join_logs');
-          activeUsers = initialActive.map(l => ({ ...l, type: 'user' }));
+          // Deduplicate by userId: keep most recent join, mark others as left
+          const latestByUser = new Map<string, any>();
+          for (const row of initialActive) {
+            const uid = String(row.userId);
+            const prev = latestByUser.get(uid);
+            if (!prev || String(row.joinedAt || '') > String(prev.joinedAt || '')) {
+              latestByUser.set(uid, row);
+            }
+          }
+          const deduped = Array.from(latestByUser.values());
+          activeUsers = deduped.map(l => ({ ...l, type: 'user' }));
+          const duplicates = initialActive.filter(r => !latestByUser.get(String(r.userId)) || String(r.joinedAt || '') < String(latestByUser.get(String(r.userId))?.joinedAt || ''));
+          if (duplicates.length > 0) {
+            const ts = String((initialActive[initialActive.length-1]?.joinedAt) || '');
+            for (const d of duplicates) {
+              try { await invoke('db_update_leave', { ts, userId: d.userId }); } catch {}
+            }
+          }
           console.debug('Loaded initial active users from DB', { count: activeUsers.length });
+          // Hydrate group flags from cache immediately (if any)
+          applyGroupWatchResults({ matches: [], aggregates: [] });
         } catch(e) {
           console.error("Failed to get active join logs", e);
         }
@@ -184,6 +303,7 @@
         }
         const newEntry: UserJoinLog = { ...p, type: 'user' };
         activeUsers = [newEntry, ...activeUsers];
+        resortActiveUsers();
         if (logPage === 0) {
           pagedLogs = [newEntry, ...pagedLogs].slice(0, LOGS_PER_PAGE);
         }
@@ -194,6 +314,7 @@
         const { id, userId, leftAt } = e.payload;
 
         activeUsers = activeUsers.filter(u => u.id !== id && u.userId !== userId);
+        resortActiveUsers();
         
         const pagedIdx = pagedLogs.findIndex(l => (l as UserJoinLog).id === id);
         if (pagedIdx !== -1) {
@@ -222,7 +343,7 @@
 
     })();
 
-    return () => { unsubs.forEach((u) => typeof u === 'function' && u()); };
+    return () => { unsubs.forEach((u) => typeof u === 'function' && u()); window.removeEventListener('group_watch_results', handleGroupResults as any); };
   });
 </script>
 
@@ -257,12 +378,19 @@
       {:else}
         {#each activeUsers as ul (ul.userId + (ul.joinedAt || ''))}
           <div class="row" role="listitem">
-            <div class="avatar" aria-hidden="true">{firstGrapheme(ul.username) || '?'}</div>
+            <div class="avatar" aria-hidden="true" class:flag-red={watchFlags.get(ul.userId)?.watchlist} class:flag-yellow={!watchFlags.get(ul.userId)?.watchlist && watchFlags.has(ul.userId)} title={watchFlags.get(ul.userId)?.notes || ''}>{firstGrapheme(ul.username) || '?'}</div>
             <div class="col">
-              <div class="name">{ul.username || 'Unknown'}</div>
+              <div class="name">{ul.username || 'Unknown'}
+                {#if ((watchFlags.get(ul.userId)?.notes ?? '').includes('{BOS}'))}
+                  <span class="pill bos small" title="BOS">BOS</span>
+                {/if}
+                {#if watchFlags.has(ul.userId)}
+                  <button class="pill link small" onclick={() => { const items = lastMatches.get(ul.userId) || []; showWatchModal = { userId: ul.userId, items }; }}>Group Watchlisted [Click Me]</button>
+                {/if}
+              </div>
               <div class="sub">{ul.userId}</div>
             </div>
-            <div class="actions stats">Warns: 0&nbsp;|&nbsp;Kicks: 0&nbsp;|&nbsp;Bans: 0
+            <div class="actions stats">Warns: {modAgg.get(ul.userId)?.warns ?? 0}&nbsp;|&nbsp;Kicks: {modAgg.get(ul.userId)?.kicks ?? 0}&nbsp;|&nbsp;Bans: {modAgg.get(ul.userId)?.bans ?? 0}
               {ensureWatchLoaded(ul.userId)}
               <button class="watch" class:active={watch.get(ul.userId)} title="Watchlist" aria-label="Watchlist" onclick={async () => { const newVal = !watch.get(ul.userId); try { await invoke('set_watch', { userId: ul.userId, watch: newVal }); watch.set(ul.userId, newVal); watch = new Map(watch); } catch {} }}>
                 {#if watch.get(ul.userId)}
@@ -315,9 +443,16 @@
           {:else}
             {@const ul = l as UserJoinLog}
             <div class="row" role="listitem">
-              <div class="avatar" aria-hidden="true">{firstGrapheme(ul.username) || '?'}</div>
+              <div class="avatar" aria-hidden="true" class:flag-red={(watchFlags.get(ul.userId)?.watchlist) ?? false} class:flag-yellow={!((watchFlags.get(ul.userId)?.watchlist) ?? false) && watchFlags.has(ul.userId)} title={watchFlags.get(ul.userId)?.notes || ''}>{firstGrapheme(ul.username) || '?'}</div>
               <div class="col">
-                <div class="name">{ul.username || 'Unknown'}</div>
+                <div class="name">{ul.username || 'Unknown'}
+                  {#if ((watchFlags.get(ul.userId)?.notes ?? '').includes('{BOS}'))}
+                    <span class="pill bos small" title="BOS">BOS</span>
+                  {/if}
+                  {#if watchFlags.has(ul.userId)}
+                    <button class="pill link small" onclick={() => { const items = lastMatches.get(ul.userId) || []; showWatchModal = { userId: ul.userId, items }; }}>Group Watchlisted [Click Me]</button>
+                  {/if}
+                </div>
                 <div class="sub">{ul.userId}</div>
                 <div class="sub time">
                   <span class="pill">Joined: {fmt(ul.joinedAt)}</span>
@@ -368,6 +503,31 @@
   </div>
 </div>
 
+{#if showWatchModal}
+  <div class="modal-backdrop" role="button" aria-label="Close dialog" tabindex="0" onkeydown={(e: KeyboardEvent) => { const k = e.key; if (k === 'Escape' || k === 'Enter' || k === ' ') showWatchModal = null; }} onclick={() => showWatchModal = null}>
+    <div class="modal" role="dialog" aria-modal="true" onclick={(e: any) => e.stopPropagation()}>
+      <header>Group Watchlisted</header>
+      <div class="body">
+        {#if showWatchModal.items && showWatchModal.items.length > 0}
+          {#each showWatchModal.items as it}
+            <div class="gw-item">
+              <div class="gw-line"><strong>{it.groupName || it.group_id}</strong></div>
+              <div class="gw-line">Notifications: - {it.watchlist ? 'On' : 'Off'}</div>
+              <div class="gw-note">{it.notes || '—'}</div>
+              <hr />
+            </div>
+          {/each}
+        {:else}
+          No notes.
+        {/if}
+      </div>
+      <footer>
+        <button onclick={() => showWatchModal = null}>Close</button>
+      </footer>
+    </div>
+  </div>
+{/if}
+
 
 <style>
   .panel { display: flex; flex-direction: column; gap: 12px; }
@@ -391,6 +551,8 @@
   .row { display: grid; grid-template-columns: 36px 1fr auto; gap: 12px; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--border); }
   .row:last-child { border-bottom: none; }
   .avatar { width: 36px; height: 36px; border-radius: 8px; background: var(--bg); color: var(--fg-muted); display: inline-flex; align-items: center; justify-content: center; font-weight: 600; }
+  .avatar.flag-red { background: rgba(255, 0, 0, 0.25); border: 1px solid rgba(255,0,0,0.35); color: var(--fg); }
+  .avatar.flag-yellow { background: rgba(255, 230, 0, 0.25); border: 1px solid rgba(255,230,0,0.35); color: var(--fg); }
   .name { color: var(--fg); font-weight: 600; }
   .sub { color: var(--fg-muted); font-size: 12px; }
   .actions.stats { color: var(--fg-muted); font-size: 12px; }
@@ -406,5 +568,19 @@
   .note-actions button { border: 1px solid var(--border); background: var(--bg); color: var(--fg); border-radius: 8px; padding: 4px 10px; cursor: pointer; }
   .sub.time { margin-top: 4px; display: flex; gap: 6px; flex-wrap: wrap; }
   .pill { border: 1px solid var(--border); background: var(--bg); color: var(--fg); border-radius: 999px; padding: 2px 8px; }
+  .pill.small { font-size: 11px; padding: 1px 6px; margin-left: 6px; }
   .row.system .avatar { background: var(--bg); color: var(--fg); }
+  .pill.link { cursor: pointer; }
+  .pill.bos { background: rgba(255,255,255,0.06); border-color: #ffb6c1; }
+
+  /* Simple modal */
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 999; }
+  .modal { width: min(560px, 92vw); background: var(--bg-elev); color: var(--fg); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 20px 60px rgba(0,0,0,0.35); }
+  .modal header { padding: 12px 14px; border-bottom: 1px solid var(--border); font-weight: 700; }
+  .modal .body { padding: 14px; white-space: pre-wrap; }
+  .modal .gw-item { padding: 6px 0; }
+  .modal .gw-line { margin: 2px 0; }
+  .modal .gw-note { margin: 4px 0 2px; opacity: 0.9; }
+  .modal footer { padding: 12px 14px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; }
+  .modal footer button { border: 1px solid var(--border); background: var(--bg); color: var(--fg); border-radius: 8px; padding: 6px 12px; cursor: pointer; }
 </style>

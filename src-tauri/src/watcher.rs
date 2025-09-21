@@ -44,6 +44,43 @@ pub fn read_log_info() -> Result<serde_json::Value, String> {
 	}
 }
 
+// Collect deduplicated substrings captured from lines containing
+// "User Authenticated:" across all available VRChat log files.
+// For each matching line, we capture everything after "Authenticated:" to EOL.
+// Example line:
+//   2025.09.18 15:16:07 Debug      -  User Authenticated: - Lumine - (usr_...)
+// Captured substring:
+//   " - Lumine - (usr_...)"
+#[tauri::command]
+pub fn get_tool_authentication_lines() -> Result<Vec<String>, String> {
+    let dir = default_vrchat_log_dir();
+    let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let entries = match fs::read_dir(&dir) { Ok(e) => e, Err(_) => return Ok(Vec::new()) };
+    for ent in entries.flatten() {
+        let p = ent.path();
+        let name = match p.file_name().and_then(|n| n.to_str()) { Some(s) => s, None => continue };
+        if !(name.starts_with("output_log_") && name.ends_with(".txt")) { continue; }
+        if let Ok(content) = fs::read_to_string(&p) {
+            for raw in content.split('\n') {
+                let line = raw.trim_end_matches('\r');
+                if let Some(idx) = line.find("User Authenticated:") {
+                    // Find the colon and capture the remainder after it
+                    if let Some(colon_idx) = line[idx..].find(":") {
+                        let start = idx + colon_idx + 1; // position after ':'
+                        let fragment = &line[start..];
+                        // Keep leading spaces to preserve raw appearance; trim trailing
+                        let captured = fragment.trim_end();
+                        if !captured.is_empty() {
+                            set.insert(captured.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(set.into_iter().collect())
+}
+
 // Stateless chunked reader used by the Log Explorer page. The UI asks for
 // bytes starting at "offset" up to "max_bytes" and we return the data along
 // with a new offset and EOF flag.
@@ -289,7 +326,7 @@ async fn log_watch_loop(app: tauri::AppHandle) -> Result<()> {
 									continue;
 								}
 								// Player joined: insert row, cache username, maybe notify
-								if let Some(caps) = re_join.captures(line) {
+                                if let Some(caps) = re_join.captures(line) {
 									let username = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
 									let uid = caps.get(2).map(|m| m.as_str()).unwrap_or("");
 									if !uid.is_empty() {
@@ -308,17 +345,16 @@ async fn log_watch_loop(app: tauri::AppHandle) -> Result<()> {
 												changed = true;
 											}
 										}
-										if changed { let _ = super::notes::save_all_notes(&all); }
-										if all.watchlist.get(uid).copied().unwrap_or(false) {
-															if all.watchlist.get(uid).copied().unwrap_or(false) {
-																#[cfg(target_os = "windows")]
-																{
-																	let msg = format!("{} has joined", username);
-																	let _ = winrt_notification::Toast::new("FCH").title("- FCH Notifier -").text1(&msg).show();
-																}
-																let _ = super::config::preview_sound();
-															}
-														}
+                                        if changed { let _ = super::notes::save_all_notes(&all); }
+                                        if all.watchlist.get(uid).copied().unwrap_or(false) {
+                                            #[cfg(target_os = "windows")]
+                                            {
+                                                let msg = format!("{} has joined", username);
+                                                let _ = winrt_notification::Toast::new("FCH").title("- FCH Notifier -").text1(&msg).show();
+                                            }
+                                            let _ = app.emit("sound_triggered", serde_json::json!({ "source": "local_watchlist", "userId": uid, "username": username, "ts": ts }));
+                                            let _ = super::config::preview_sound();
+                                        }
 									}
 									continue;
 								}

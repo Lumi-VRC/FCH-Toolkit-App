@@ -37,6 +37,8 @@ pub fn run() {
 			watcher::read_log_info,
 			watcher::read_log_chunk,
 			watcher::search_log_file,
+			// Tool authentication support
+			watcher::get_tool_authentication_lines,
 			// Notes/watchlist operations
 			notes::add_note,
 			notes::get_notes,
@@ -56,8 +58,16 @@ pub fn run() {
 			db::get_active_join_logs,
 			db::purge_join_log_table,
 			db::get_latest_username_for_user,
+			// Startup maintenance and persistence
+			db::dedupe_open_joins,
+			db::set_group_watchlisted_for_users,
+			// Access token storage
+			db::add_group_access_token,
+			db::list_group_access_tokens,
+			db::remove_group_access_token,
 		])
 		// Start the runtime with settings resolved from tauri.conf.json
 		.run(tauri::generate_context!())
 		.expect("error while running tauri application");
 }
+// If you're reading this... hiii!

@@ -4,7 +4,7 @@
   let { collapsed = false, activeIndex = 0, onToggle = () => {}, onSelect = (_: number) => {} } = $props();
 
   const labels = [
-    'Dashboard', 'Instance Monitor', 'Database', 'Log Explorer', 'World Moderation', 'Settings', 'About'
+    'Login', 'Instance Monitor', 'Database', 'Log Explorer', 'World Moderation', 'Settings', 'About'
   ];
 
   let updateAvailable = $state(false);
@@ -52,18 +52,22 @@
   // on startup (client), check once
   onMount(() => { runUpdateCheck(); });
 
-  async function onUpdateButtonClick() {
+  async function onUpdateButtonClick(_e: MouseEvent) {
     await runUpdateCheck();
     if (updateAvailable) { showUpdateModal = true; }
     else {
-      try { const { open } = await import('@tauri-apps/plugin-opener'); await open('https://github.com/Lumi-VRC/FCH-Toolkit-App/releases/latest'); } catch {}
+      try {
+        const plugin = await import('@tauri-apps/plugin-opener');
+        const fn: any = (plugin as any).open || (plugin as any).default || (plugin as any);
+        if (typeof fn === 'function') await fn('https://github.com/Lumi-VRC/FCH-Toolkit-App/releases/latest');
+      } catch {}
     }
   }
 </script>
 
 <aside class:collapsed>
   <div class="top">
-    <button class="collapse" onclick={onToggle} aria-label="Toggle sidebar">
+    <button class="collapse" onclick={() => onToggle()} aria-label="Toggle sidebar">
       <span aria-hidden="true">{#if collapsed}›{/if}{#if !collapsed}‹{/if}</span>
     </button>
   </div>
