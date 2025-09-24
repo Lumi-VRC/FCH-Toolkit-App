@@ -179,6 +179,28 @@ pub fn db_update_leave(app: &tauri::AppHandle, ts: &str, user_id: &str, emit: bo
 	// OK :DDDDDDD
 }
 
+// Update leave timestamp by matching the most recent open row for a given username
+// Useful when logs do not include the user ID on leave (e.g., "Destroying <username>")
+pub fn db_update_leave_by_username(app: &tauri::AppHandle, ts: &str, username: &str, emit: bool) -> Result<()> {
+    if ts.is_empty() || username.trim().is_empty() { return Ok(()); }
+    db_init()?;
+    let conn = rusqlite::Connection::open(db_path())?;
+    let mut stmt = conn.prepare(
+        "SELECT id, user_id FROM join_log WHERE username = ?1 AND leave_timestamp IS NULL AND is_system = 0 ORDER BY join_timestamp DESC LIMIT 1"
+    )?;
+    let mut rows = stmt.query(rusqlite::params![username])?;
+    if let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
+        let uid: String = row.get(1)?;
+        conn.execute("UPDATE join_log SET leave_timestamp = ?1 WHERE id = ?2", rusqlite::params![ts, id])?;
+        if emit {
+            let payload = serde_json::json!({ "id": id, "userId": uid, "leftAt": ts });
+            app.emit("db_row_updated", payload)?;
+        }
+    }
+    Ok(())
+}
+
 // Insert a system event row (e.g., instance_changed) with optional context
 // Planned updates will use context window
 // Update: I forgot what I update I planned for that part. I'm sure it was a good idea.

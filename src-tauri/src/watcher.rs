@@ -6,6 +6,7 @@ use std::{fs, io::{Read, Seek, SeekFrom}, path::PathBuf, time::{Duration, Instan
 use anyhow::Result;
 use regex::Regex;
 use tauri::Emitter; // brings .emit() for sending events to the front-end
+use chrono::Local;
 
 // Debug-only logging helper. To troubleshoot tailing, replace the body with
 // eprintln!($($t)*); to see messages at runtime. Left empty to avoid spam.
@@ -170,6 +171,8 @@ async fn log_watch_loop(app: tauri::AppHandle) -> Result<()> {
 	let re_purge1 = Regex::new(r"Successfully left room").unwrap();
 	let re_purge2 = Regex::new(r"VRCNP: Stopping server").unwrap();
 	let re_purge3 = Regex::new(r"Successfully joined room").unwrap();
+	let re_quit = Regex::new(r"VRCApplication:\s*HandleApplicationQuit").unwrap();
+	let re_destroying = Regex::new(r"Destroying\s+([^\r\n]+)").unwrap();
 	let re_joining = Regex::new(r"Joining\s+(wrld_[a-f0-9\-]{36}):([^~\s]+)(?:~region\(([^)]+)\))?").unwrap();
 
 	// Current file and tailing state
@@ -195,7 +198,18 @@ async fn log_watch_loop(app: tauri::AppHandle) -> Result<()> {
 				if let Some(p) = latest.clone() {
 					match fs::File::open(&p) {
 						Ok(mut f) => {
-							let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+												let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+												// Purge if the log filename changed since last run (rotation)
+												if let Some(name_os) = p.file_name() {
+													if let Some(name) = name_os.to_str() {
+														let prev = super::db::db_get_state("last_log_filename").unwrap_or(None);
+														if prev.as_deref() != Some(name) {
+															let ts_now = Local::now().format("%Y.%m.%d %H:%M:%S").to_string();
+															let _ = super::db::db_purge_all(&app, &ts_now, true);
+															let _ = super::db::db_set_state("last_log_filename", name);
+														}
+													}
+												}
 							// Backfill once on the very first open to reconstruct who is active
 							if is_initial_open {
 								const BACKFILL_SCAN_MAX: u64 = 4 * 1024 * 1024; // scan last 4MB for context
@@ -215,9 +229,9 @@ async fn log_watch_loop(app: tauri::AppHandle) -> Result<()> {
 										let last_joining_idx = lines.iter().rposition(|raw| re_joining.is_match(raw.trim_end_matches('\r')));
 										if let Some(start_idx) = last_joining_idx {
 											// If the log shows a clean purge after joining, skip backfill
-											let purged_after_join = lines[start_idx+1..].iter().any(|raw| {
+												let purged_after_join = lines[start_idx+1..].iter().any(|raw| {
 												let line = raw.trim_end_matches('\r');
-												re_purge1.is_match(line) || re_purge2.is_match(line)
+													re_purge1.is_match(line) || re_purge2.is_match(line) || re_purge3.is_match(line) || re_quit.is_match(line)
 											});
 											if !purged_after_join {
 												if let Some(joining_line) = lines.get(start_idx) {
@@ -309,8 +323,8 @@ async fn log_watch_loop(app: tauri::AppHandle) -> Result<()> {
 								if line.is_empty() { continue; }
 								let ts_cap = re_ts.captures(line).and_then(|c| c.get(1)).map(|m| m.as_str());
 								let ts = match ts_cap { Some(t) => t, None => continue };
-								// Purge triggers: end-of-session markers or explicit VRChat logs
-								if re_purge1.is_match(line) || re_purge2.is_match(line) || re_purge3.is_match(line) {
+																		// Purge triggers: end-of-session markers or explicit VRChat logs
+																		if re_purge1.is_match(line) || re_purge2.is_match(line) || re_purge3.is_match(line) || re_quit.is_match(line) {
 									if let Err(e) = super::db::db_purge_all(&app, ts, true) { eprintln!("[watcher] failed to purge all: {e:?}"); }
 									continue;
 								}
@@ -358,12 +372,18 @@ async fn log_watch_loop(app: tauri::AppHandle) -> Result<()> {
 									}
 									continue;
 								}
-								// Player left: update the most recent open join for that user
-								if let Some(caps) = re_left.captures(line) {
-									let uid = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-									if !uid.is_empty() { if let Err(e) = super::db::db_update_leave(&app, ts, uid, true) { eprintln!("[watcher] failed to update leave: {e:?}"); } }
-									continue;
-								}
+																		// Player left: update the most recent open join for that user
+																		if let Some(caps) = re_left.captures(line) {
+																			let uid = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+																			if !uid.is_empty() { if let Err(e) = super::db::db_update_leave(&app, ts, uid, true) { eprintln!("[watcher] failed to update leave: {e:?}"); } }
+																			continue;
+																		}
+																		// Fallback: some leaves log as "Destroying <username>"
+																		if let Some(caps) = re_destroying.captures(line) {
+																			let username = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+																			if !username.is_empty() { if let Err(e) = super::db::db_update_leave_by_username(&app, ts, username, true) { eprintln!("[watcher] failed to update leave by username: {e:?}"); } }
+																			continue;
+																		}
 							}
 						}
 					}
