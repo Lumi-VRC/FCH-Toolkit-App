@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
+  import { pushDebug, setLiveViewCounts } from '$lib/stores/debugLog';
 
   type UserJoinLog = { id?: number; type: 'user'; userId: string; username?: string; joinedAt?: string; leftAt?: string; groupWatchlisted?: boolean };
   type SystemLog = { type: 'system'; ts?: string; message: string; worldId?: string; instanceId?: string; region?: string };
@@ -22,9 +23,148 @@
   let watch = $state(new Map<string, boolean>());
   let watchFlags = $state(new Map<string, { watchlist: boolean; notes?: string }>());
   let modAgg = $state(new Map<string, { warns: number; kicks: number; bans: number }>());
+  let avatarPerf = $state(new Map<string, { rating: string; updatedAt?: string }>());
   type GroupMatch = { group_id: string; groupName?: string; notes?: string; watchlist?: boolean };
   let showWatchModal: { userId: string; items: GroupMatch[] } | null = $state(null);
+  type AvatarModalState = {
+    userId: string;
+    username?: string;
+    avatarName?: string;
+    timestamp?: string;
+    details: any[];
+    loading: boolean;
+    error?: string;
+  };
+  let avatarModal: AvatarModalState | null = $state(null);
   let lastMatches = $state(new Map<string, GroupMatch[]>());
+
+  const closeWatchModal = () => { showWatchModal = null; };
+  const closeAvatarModal = () => { avatarModal = null; };
+
+  const handleBackdropKey = (e: KeyboardEvent) => {
+    const key = e.key;
+    if (key === 'Escape' || key === 'Enter' || key === ' ') {
+      e.preventDefault();
+      showWatchModal = null;
+    }
+  };
+
+  const stopModalClick = (event: MouseEvent) => {
+    event.stopPropagation();
+  };
+
+  const handleModalKey = (event: KeyboardEvent) => {
+    if (event.key === 'Escape') {
+      event.stopPropagation();
+      event.preventDefault();
+      closeWatchModal();
+    }
+  };
+
+  const handleAvatarBackdropKey = (e: KeyboardEvent) => {
+    const key = e.key;
+    if (key === 'Escape' || key === 'Enter' || key === ' ') {
+      e.preventDefault();
+      closeAvatarModal();
+    }
+  };
+
+  const stopAvatarModalClick = (event: MouseEvent) => {
+    event.stopPropagation();
+  };
+
+  const handleAvatarModalKey = (event: KeyboardEvent) => {
+    if (event.key === 'Escape') {
+      event.stopPropagation();
+      event.preventDefault();
+      closeAvatarModal();
+    }
+  };
+
+  function hasData(obj: unknown): boolean {
+    return !!(obj && typeof obj === 'object' && Object.keys(obj as Record<string, unknown>).length > 0);
+  }
+
+  function toPrettyJson(value: unknown): string {
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return String(value ?? '');
+    }
+  }
+
+  async function openAvatarModal(userId: string, username?: string) {
+    let state: AvatarModalState = { userId, username, details: [], loading: true };
+    avatarModal = state;
+    try {
+      const latest: any = await invoke('get_latest_avatar_for_user', { userId, username });
+      const rawName = latest?.avatarName ?? latest?.avatar_name ?? '';
+      const avatarName = typeof rawName === 'string' ? rawName.trim() : '';
+      const timestamp = typeof latest?.timestamp === 'string' ? latest.timestamp : undefined;
+      state = { ...state, avatarName: avatarName || undefined, timestamp };
+      avatarModal = state;
+
+      let details: any[] = [];
+      if (avatarName) {
+        try {
+          const res: any = await invoke('db_get_avatar_details', { avatarName });
+          if (Array.isArray(res)) {
+            details = res;
+          }
+        } catch (detailErr) {
+          console.error('Failed to load avatar details', detailErr);
+        }
+      }
+
+      state = { ...state, details, loading: false };
+      avatarModal = state;
+    } catch (err) {
+      console.error('Failed to load avatar data', err);
+      state = { ...state, loading: false, error: 'Failed to load avatar data.' };
+      avatarModal = state;
+    }
+  }
+
+  async function pollAvatarStatus() {
+    pushDebug('[avatarPerf] poll start');
+    const next = new Map<string, { rating: string; updatedAt?: string }>();
+    if (activeUsers.length === 0) {
+      pushDebug('[avatarPerf] skipped, no active users');
+      avatarPerf = next;
+      return;
+    }
+    await Promise.all(
+      activeUsers.map(async (user) => {
+        try {
+          const latest: any = await invoke('get_latest_avatar_for_user', {
+            userId: user.userId,
+            username: user.username || undefined
+          });
+          const rawName = latest?.avatarName ?? latest?.avatar_name ?? '';
+          const avatarName = typeof rawName === 'string' ? rawName.trim() : '';
+          if (!avatarName) {
+            return;
+          }
+          const details: any[] = await invoke('db_get_avatar_details', { avatarName });
+          const rating = Array.isArray(details) && details.length > 0
+            ? details[0]?.performanceRating ?? null
+            : null;
+          if (rating && typeof rating === 'string') {
+            next.set(user.userId, { rating, updatedAt: latest?.timestamp });
+            pushDebug(`[avatarPerf] rating updated :: user=${user.userId} username=${user.username} avatar=${avatarName} rating=${rating}`);
+          } else {
+            pushDebug(`[avatarPerf] rating missing :: user=${user.userId} username=${user.username} avatar=${avatarName}`);
+          }
+        } catch (err) {
+          console.warn('avatar poll failed', user.userId, err);
+          pushDebug(`[avatarPerf] poll failed :: user=${user.userId} username=${user.username} err=${String(err)}`);
+        }
+      })
+    );
+    pushDebug(`[avatarPerf] poll complete :: updated=${next.size}`);
+    avatarPerf = next;
+    setLiveViewCounts(avatarPerf.size, activeUsers.length);
+  }
 
   async function handleDeleteClick() {
     if (!confirmingDelete) {
@@ -38,6 +178,7 @@
       activeUsers = [];
       logPage = 0;
       logsLoadedOnce = false; // allow re-fetch on next tab click
+      pushDebug('Join log table purged from UI (Live View cleared)');
       console.debug('Successfully purged join log table');
     } catch(e) {
       console.error("Failed to purge join log table", e);
@@ -238,6 +379,7 @@
 
   onMount(() => {
     const unsubs: Array<() => void> = [];
+    let pollTimer: number | undefined;
     const handleGroupResults = (ev: any) => {
       const d = ev?.detail;
       if (!d) return;
@@ -275,6 +417,9 @@
           }
           const deduped = Array.from(latestByUser.values());
           activeUsers = deduped.map(l => ({ ...l, type: 'user' }));
+          setLiveViewCounts(avatarPerf.size, activeUsers.length);
+          pushDebug(`Backfilled ${activeUsers.length} active user(s) on watcher ready`);
+          void pollAvatarStatus();
           const duplicates = initialActive.filter(r => !latestByUser.get(String(r.userId)) || String(r.joinedAt || '') < String(latestByUser.get(String(r.userId))?.joinedAt || ''));
           if (duplicates.length > 0) {
             const ts = String((initialActive[initialActive.length-1]?.joinedAt) || '');
@@ -304,6 +449,12 @@
         const newEntry: UserJoinLog = { ...p, type: 'user' };
         activeUsers = [newEntry, ...activeUsers];
         resortActiveUsers();
+        setLiveViewCounts(
+          Math.min(avatarPerf.size, activeUsers.length),
+          activeUsers.length
+        );
+        pollAvatarStatus();
+        pushDebug(`User joined: ${newEntry.username || 'Unknown'} (${newEntry.userId})`);
         if (logPage === 0) {
           pagedLogs = [newEntry, ...pagedLogs].slice(0, LOGS_PER_PAGE);
         }
@@ -315,6 +466,14 @@
 
         activeUsers = activeUsers.filter(u => u.id !== id && u.userId !== userId);
         resortActiveUsers();
+        setLiveViewCounts(
+          Math.min(avatarPerf.size, activeUsers.length),
+          activeUsers.length
+        );
+        pollAvatarStatus();
+        if (userId) {
+          pushDebug(`User left: ${userId} at ${leftAt || 'unknown'}`);
+        }
         
         const pagedIdx = pagedLogs.findIndex(l => (l as UserJoinLog).id === id);
         if (pagedIdx !== -1) {
@@ -328,6 +487,10 @@
         console.debug('[event:db_purged]', e);
         const { ts } = e.payload;
         activeUsers = [];
+        avatarPerf.clear();
+        avatarPerf = new Map(avatarPerf);
+        pushDebug(`Live View cleared due to purge at ${ts}`);
+        setLiveViewCounts(0, 0);
         pagedLogs = pagedLogs.map(l => {
           if (l.type === 'user' && !(l as UserJoinLog).leftAt) {
             return { ...(l as UserJoinLog), leftAt: ts } as UserJoinLog;
@@ -343,7 +506,21 @@
 
     })();
 
-    return () => { unsubs.forEach((u) => typeof u === 'function' && u()); window.removeEventListener('group_watch_results', handleGroupResults as any); };
+    const startPolling = () => {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = window.setInterval(() => {
+        void pollAvatarStatus();
+      }, 10_000);
+      void pollAvatarStatus();
+    };
+
+    startPolling();
+
+    return () => {
+      unsubs.forEach((u) => typeof u === 'function' && u());
+      window.removeEventListener('group_watch_results', handleGroupResults as any);
+      if (pollTimer) clearInterval(pollTimer);
+    };
   });
 </script>
 
@@ -390,7 +567,24 @@
               </div>
               <div class="sub">{ul.userId}</div>
             </div>
-            <div class="actions stats">Warns: {modAgg.get(ul.userId)?.warns ?? 0}&nbsp;|&nbsp;Kicks: {modAgg.get(ul.userId)?.kicks ?? 0}&nbsp;|&nbsp;Bans: {modAgg.get(ul.userId)?.bans ?? 0}
+            <div class="actions stats">
+              {#if avatarPerf.get(ul.userId)?.rating}
+                <span class="pill perf" title={`Avatar performance rating: ${avatarPerf.get(ul.userId)?.rating}`}>
+                  {avatarPerf.get(ul.userId)?.rating}
+                </span>
+              {/if}
+              <button
+                class="avatar-details"
+                title="Avatar details"
+                aria-label="Avatar details"
+                onclick={() => openAvatarModal(ul.userId, ul.username)}
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <circle cx="12" cy="7" r="4" stroke="currentColor" stroke-width="1.5" />
+                  <path d="M5 20c0-3.314 3.134-6 7-6s7 2.686 7 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+                </svg>
+              </button>
+              <span class="stats-pill">Warns: {modAgg.get(ul.userId)?.warns ?? 0}&nbsp;|&nbsp;Kicks: {modAgg.get(ul.userId)?.kicks ?? 0}&nbsp;|&nbsp;Bans: {modAgg.get(ul.userId)?.bans ?? 0}</span>
               {ensureWatchLoaded(ul.userId)}
               <button class="watch" class:active={watch.get(ul.userId)} title="Watchlist" aria-label="Watchlist" onclick={async () => { const newVal = !watch.get(ul.userId); try { await invoke('set_watch', { userId: ul.userId, watch: newVal }); watch.set(ul.userId, newVal); watch = new Map(watch); } catch {} }}>
                 {#if watch.get(ul.userId)}
@@ -461,7 +655,18 @@
                   {/if}
                 </div>
               </div>
-              <div class="actions stats">
+            <div class="actions stats">
+              <button
+                class="avatar-details"
+                title="Avatar details"
+                aria-label="Avatar details"
+                onclick={() => openAvatarModal(ul.userId, ul.username)}
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <circle cx="12" cy="7" r="4" stroke="currentColor" stroke-width="1.5" />
+                  <path d="M5 20c0-3.314 3.134-6 7-6s7 2.686 7 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+                </svg>
+              </button>
                 {ensureWatchLoaded(ul.userId)}
                 <button class="watch" class:active={watch.get(ul.userId)} title="Watchlist" aria-label="Watchlist" onclick={async () => { const newVal = !watch.get(ul.userId); try { await invoke('set_watch', { userId: ul.userId, watch: newVal }); watch.set(ul.userId, newVal); watch = new Map(watch); } catch {} }}>
                   {#if watch.get(ul.userId)}
@@ -504,8 +709,15 @@
 </div>
 
 {#if showWatchModal}
-  <div class="modal-backdrop" role="button" aria-label="Close dialog" tabindex="0" onkeydown={(e: KeyboardEvent) => { const k = e.key; if (k === 'Escape' || k === 'Enter' || k === ' ') showWatchModal = null; }} onclick={() => showWatchModal = null}>
-    <div class="modal" role="dialog" aria-modal="true" onclick={(e: any) => e.stopPropagation()}>
+  <div
+    class="modal-backdrop"
+    role="button"
+    aria-label="Close dialog"
+    tabindex="0"
+    onkeydown={handleBackdropKey}
+    onclick={closeWatchModal}
+  >
+    <div class="modal" role="dialog" aria-modal="true" tabindex="-1" onclick={stopModalClick} onkeydown={handleModalKey}>
       <header>Group Watchlisted</header>
       <div class="body">
         {#if showWatchModal.items && showWatchModal.items.length > 0}
@@ -522,7 +734,69 @@
         {/if}
       </div>
       <footer>
-        <button onclick={() => showWatchModal = null}>Close</button>
+        <button onclick={closeWatchModal}>Close</button>
+      </footer>
+    </div>
+  </div>
+{/if}
+
+{#if avatarModal}
+  <div
+    class="modal-backdrop"
+    role="button"
+    aria-label="Close dialog"
+    tabindex="0"
+    onkeydown={handleAvatarBackdropKey}
+    onclick={closeAvatarModal}
+  >
+    <div class="modal" role="dialog" aria-modal="true" tabindex="-1" onclick={stopAvatarModalClick} onkeydown={handleAvatarModalKey}>
+      <header>{avatarModal.avatarName || 'Avatar Details'}</header>
+      <div class="body">
+        {#if avatarModal.loading}
+          <p>Loading…</p>
+        {:else if avatarModal.error}
+          <p class="error">{avatarModal.error}</p>
+        {:else}
+          <div class="meta-block">
+            <div><strong>User:</strong> {avatarModal.username || avatarModal.userId}</div>
+            {#if avatarModal.timestamp}
+              <div><strong>Last Seen:</strong> {fmt(avatarModal.timestamp)}</div>
+            {/if}
+            {#if avatarModal.avatarName}
+              <div><strong>Avatar:</strong> {avatarModal.avatarName}</div>
+            {/if}
+          </div>
+          {#if avatarModal.details.length === 0}
+            <p>No avatar details stored yet.</p>
+          {:else}
+            {#each avatarModal.details as detail, idx}
+              <div class="detail-card">
+                <div class="detail-row"><strong>Owner:</strong> {detail.ownerId}</div>
+                <div class="detail-row"><strong>Version:</strong> {detail.version}</div>
+                <div class="detail-row"><strong>File ID:</strong> {detail.fileId || '—'}</div>
+                <div class="detail-row"><strong>Updated:</strong> {detail.updatedAt}</div>
+                {#if hasData(detail.file)}
+                  <details>
+                    <summary>File JSON</summary>
+                    <pre>{toPrettyJson(detail.file)}</pre>
+                  </details>
+                {/if}
+                {#if hasData(detail.security)}
+                  <details>
+                    <summary>Security JSON</summary>
+                    <pre>{toPrettyJson(detail.security)}</pre>
+                  </details>
+                {/if}
+              </div>
+              {#if idx < avatarModal.details.length - 1}
+                <hr />
+              {/if}
+            {/each}
+          {/if}
+        {/if}
+      </div>
+      <footer>
+        <button onclick={closeAvatarModal}>Close</button>
       </footer>
     </div>
   </div>
@@ -555,7 +829,10 @@
   .avatar.flag-yellow { background: rgba(255, 230, 0, 0.25); border: 1px solid rgba(255,230,0,0.35); color: var(--fg); }
   .name { color: var(--fg); font-weight: 600; }
   .sub { color: var(--fg-muted); font-size: 12px; }
-  .actions.stats { color: var(--fg-muted); font-size: 12px; }
+  .actions.stats { color: var(--fg-muted); font-size: 12px; display: inline-flex; align-items: center; gap: 6px; }
+  .actions.stats .avatar-details { border: 1px solid var(--border); background: var(--bg); color: var(--fg); border-radius: 6px; padding: 2px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; }
+  .actions.stats .avatar-details:hover { background: rgba(255, 182, 193, 0.25); border-color: #ffb6c1; }
+  .actions.stats .stats-pill { display: inline-flex; }
   .actions.stats .note { margin-left: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--fg); border-radius: 6px; padding: 2px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; vertical-align: middle; }
   .actions.stats .note svg { display: block; }
   .actions.stats .note.has-note { background: rgba(255, 182, 193, 0.35); border-color: #ffb6c1; }
@@ -572,12 +849,20 @@
   .row.system .avatar { background: var(--bg); color: var(--fg); }
   .pill.link { cursor: pointer; }
   .pill.bos { background: rgba(255,255,255,0.06); border-color: #ffb6c1; }
+  .pill.perf { background: rgba(0, 128, 255, 0.15); border-color: rgba(0, 128, 255, 0.45); font-weight: 600; }
 
   /* Simple modal */
   .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 999; }
   .modal { width: min(560px, 92vw); background: var(--bg-elev); color: var(--fg); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 20px 60px rgba(0,0,0,0.35); }
   .modal header { padding: 12px 14px; border-bottom: 1px solid var(--border); font-weight: 700; }
-  .modal .body { padding: 14px; white-space: pre-wrap; }
+  .modal .body { padding: 14px; white-space: pre-wrap; display: grid; gap: 12px; }
+  .modal .body .meta-block { display: grid; gap: 4px; font-size: 13px; color: var(--fg); }
+  .modal .body .detail-card { border: 1px solid var(--border); border-radius: 8px; padding: 10px; display: grid; gap: 6px; background: var(--bg); color: var(--fg); }
+  .modal .body .detail-row { font-size: 13px; color: var(--fg-muted); }
+  .modal .body details { background: rgba(255,255,255,0.03); border-radius: 6px; padding: 6px 8px; }
+  .modal .body details summary { cursor: pointer; color: var(--fg); font-weight: 600; }
+  .modal .body pre { max-height: 220px; overflow: auto; font-size: 12px; background: rgba(0,0,0,0.25); padding: 8px; border-radius: 6px; color: var(--fg); }
+  .modal .body .error { color: var(--fg-err); }
   .modal .gw-item { padding: 6px 0; }
   .modal .gw-line { margin: 2px 0; }
   .modal .gw-note { margin: 4px 0 2px; opacity: 0.9; }

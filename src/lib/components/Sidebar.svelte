@@ -4,7 +4,7 @@
   let { collapsed = false, activeIndex = 0, onToggle = () => {}, onSelect = (_: number) => {} } = $props();
 
   const labels = [
-    'Login', 'Instance Monitor', 'Database', 'Log Explorer', 'World Moderation', 'Settings', 'About'
+    'Login', 'Instance Monitor', 'Database', 'Log Explorer', 'World Moderation', 'Settings', 'Debug', 'About'
   ];
 
   let updateAvailable = $state(false);
@@ -79,7 +79,19 @@
         onClick={() => onSelect(i)}
         showLabel={!collapsed}
         label={title}
-        icon={(i === 1) ? 'list' : (i === 2) ? 'vault' : (i === 3) ? 'search' : (i === 5) ? 'gear' : 'dot'}
+        icon={(i === 1)
+          ? 'list'
+          : (i === 2)
+          ? 'vault'
+          : (i === 3)
+          ? 'search'
+          : (i === 4)
+          ? 'globe'
+          : (i === 5)
+          ? 'gear'
+          : (i === 6)
+          ? 'bug'
+          : 'dot'}
       />
     {/each}
   </div>

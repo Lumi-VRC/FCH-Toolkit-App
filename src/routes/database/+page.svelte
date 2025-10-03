@@ -2,11 +2,12 @@
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   type Note = { ts: string; text: string };
-  let entries = $state([] as Array<{ userId: string; notes: Note[]; username?: string; watch?: boolean }>);
+  let entries = $state([] as Array<{ userId: string; notes: Note[]; username?: string; watch?: boolean; soundPath?: string }>);
   let open: Record<string, boolean> = $state({});
   let editing: Record<string, boolean> = $state({});
   let confirming: Record<string, boolean> = $state({});
   let draft: Record<string, string> = $state({});
+  let soundDraft: Record<string, string> = $state({});
   let query = $state('');
   let showWatchOnly = $state(false);
   let adding = $state(false);
@@ -14,6 +15,7 @@
   let newUsername = $state('');
   let newNote = $state('');
   let newWatch = $state(true);
+  let newSound = $state('');
 
   async function prefillUsername() {
     const id = (newUserId || '').trim();
@@ -35,10 +37,11 @@
       if (newUsername != null) {
         await invoke('set_username', { userId: id, username: newUsername || '' });
       }
+      await invoke('set_user_sound', { userId: id, path: newSound.trim() ? newSound : null });
       // Refresh list
       await load();
       // Reset UI
-      newUserId = ''; newUsername = ''; newNote = ''; newWatch = true; adding = false;
+      newUserId = ''; newUsername = ''; newNote = ''; newWatch = true; newSound = ''; adding = false;
     } catch {}
   }
 
@@ -48,16 +51,37 @@
       const map = res?.notes || {};
       const usernames = res?.usernames || {};
       const watchlist = res?.watchlist || {};
-      const list: Array<{ userId: string; notes: Note[]; username?: string; watch?: boolean }> = Object.entries(map).map(([userId, notes]: any) => ({ userId, notes: notes as Note[], username: usernames[userId], watch: !!watchlist[userId] })).sort((a,b)=>a.userId.localeCompare(b.userId));
+      const sounds = res?.sounds || {};
+      const list: Array<{ userId: string; notes: Note[]; username?: string; watch?: boolean; soundPath?: string }> = Object.entries(map)
+        .map(([userId, notes]: any) => ({
+          userId,
+          notes: notes as Note[],
+          username: usernames[userId],
+          watch: !!watchlist[userId],
+          soundPath: typeof sounds[userId] === 'string' ? sounds[userId] : undefined
+        }))
+        .sort((a,b)=>a.userId.localeCompare(b.userId));
       entries = list;
-      for (const e of list) { open[e.userId] = true; draft[e.userId] = (e.notes?.[e.notes.length-1]?.text) || ''; }
-      open = { ...open }; draft = { ...draft };
+      for (const e of list) {
+        open[e.userId] = true;
+        draft[e.userId] = (e.notes?.[e.notes.length-1]?.text) || '';
+        soundDraft[e.userId] = e.soundPath || '';
+      }
+      open = { ...open }; draft = { ...draft }; soundDraft = { ...soundDraft };
     } catch {}
   }
 
   async function save(userId: string) {
     try { await invoke('add_note', { userId, text: draft[userId] || '' }); editing[userId] = false; } catch {}
     editing = { ...editing };
+  }
+
+  async function saveSoundOverride(userId: string) {
+    const path = (soundDraft[userId] || '').trim();
+    try {
+      await invoke('set_user_sound', { userId, path: path.length > 0 ? path : null });
+      entries = entries.map((ent) => ent.userId === userId ? { ...ent, soundPath: path || undefined } : ent);
+    } catch {}
   }
   async function remove(userId: string) {
     const row = document.getElementById('row-' + userId);
@@ -89,16 +113,18 @@
   {#if adding}
     <div class="add-panel">
       <div class="grid">
-        <label>User ID</label>
+        <label for="new-user-id">User ID</label>
         <div class="row">
-          <input placeholder="usr_..." bind:value={newUserId} onchange={prefillUsername} onblur={prefillUsername} />
+          <input id="new-user-id" placeholder="usr_..." bind:value={newUserId} onchange={prefillUsername} onblur={prefillUsername} />
           <button class="mini" onclick={prefillUsername}>Lookup</button>
         </div>
-        <label>Username</label>
-        <input placeholder="Will backfill if known" bind:value={newUsername} />
-        <label>Note</label>
-        <textarea placeholder="Optional note..." bind:value={newNote}></textarea>
-        <label class="inline"><input type="checkbox" bind:checked={newWatch} /> Watchlist</label>
+        <label for="new-username">Username</label>
+        <input id="new-username" placeholder="Will backfill if known" bind:value={newUsername} />
+        <label for="new-note">Note</label>
+        <textarea id="new-note" placeholder="Optional note..." bind:value={newNote}></textarea>
+        <label class="inline" for="new-watch"><input id="new-watch" type="checkbox" bind:checked={newWatch} /> Watchlist</label>
+        <label for="new-sound">Custom Sound Override</label>
+        <input id="new-sound" placeholder="C:\\path\\to\\sound.mp3" bind:value={newSound} />
       </div>
       <div class="actions">
         <button onclick={() => { adding = false; }}>Cancel</button>
@@ -136,6 +162,17 @@
                   {/if}
                 {/if}
               </div>
+            <div class="sound-editor">
+              <label for={`sound-${e.userId}`}>Custom Sound Path</label>
+              <div class="sound-row">
+                <input id={`sound-${e.userId}`} placeholder="C:\\path\\override.mp3" bind:value={soundDraft[e.userId]} />
+                <button onclick={() => saveSoundOverride(e.userId)}>Save Sound</button>
+                <button onclick={async () => { try { const res: any = await invoke('browse_sound'); const p = res?.path || null; if (p) { soundDraft[e.userId] = p; soundDraft = { ...soundDraft }; await saveSoundOverride(e.userId); } } catch {} }}>Browse</button>
+                {#if soundDraft[e.userId]?.trim()?.length}
+                  <button onclick={() => { soundDraft[e.userId] = ''; soundDraft = { ...soundDraft }; saveSoundOverride(e.userId); }}>Clear</button>
+                {/if}
+              </div>
+            </div>
             </div>
           {/if}
         </div>

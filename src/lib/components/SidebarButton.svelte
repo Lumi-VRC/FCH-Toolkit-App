@@ -4,7 +4,7 @@
   export let onClick: () => void = () => {};
   export let showLabel: boolean = false;
   export let label: string = "";
-  export let icon: 'dot' | 'list' | 'search' | 'gear' | 'vault' = 'dot';
+export let icon: 'dot' | 'list' | 'search' | 'gear' | 'vault' | 'bug' | 'globe' = 'dot';
 </script>
 
 <button class:selected class:center={!showLabel} onclick={onClick} class="btn" aria-pressed={selected} {title}>
@@ -32,6 +32,21 @@
         <circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="1.5"/>
         <path d="M12 9v2M12 12l1.5 1.5M12 12l-1.5 1.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
         <path d="M6 19v2M18 19v2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+      </svg>
+    {:else if icon === 'bug'}
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M12 6c-1.657 0-3 1.343-3 3v6a3 3 0 006 0V9c0-1.657-1.343-3-3-3z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+        <path d="M9 9H7.5a1.5 1.5 0 010-3H9m6 3h1.5a1.5 1.5 0 100-3H15" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        <path d="M6 12h2m8 0h2M5 16h3m8 0h3M6.5 8L5 6m13 2l1.5-2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        <path d="M12 6V4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+      </svg>
+    {:else if icon === 'globe'}
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.5" />
+        <path d="M12 3v18" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        <path d="M3 12h18" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        <path d="M5.5 7c1.8 1.2 3.9 1.8 6.5 1.8S16.2 8.2 18 7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        <path d="M5.5 17c1.8-1.2 3.9-1.8 6.5-1.8S16.2 15.8 18 17" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
       </svg>
     {:else}
       <!-- default dot -->

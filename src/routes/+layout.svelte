@@ -4,9 +4,13 @@
   import InstanceMonitor from './instance-monitor/+page.svelte';
   import LogExplorer from './log-explorer/+page.svelte';
   import DatabasePage from './database/+page.svelte';
-  import SettingsPanel from './settings/+page.svelte';
-  import { onMount } from 'svelte';
-  import { invoke } from '@tauri-apps/api/core';
+import SettingsPanel from './settings/+page.svelte';
+import DebugPanel from './debug/+page.svelte';
+import WorldModeration from './world-moderation/+page.svelte';
+import { onMount } from 'svelte';
+import { invoke } from '@tauri-apps/api/core';
+import { pushDebug, setApiQueueLength } from '$lib/stores/debugLog';
+import { getResultsStore, pushResult } from '$lib/stores/apiChecks';
   let collapsed = $state(true);
   let activeIndex = $state(0);
 
@@ -14,7 +18,14 @@
   function selectTab(i: number) { activeIndex = i; }
 
   const tabTitles = [
-    'Login', 'Instance Monitor', 'Database', 'Log Explorer', 'World Moderation', 'Settings', 'About'
+    'Login',
+    'Instance Monitor',
+    'Database',
+    'Log Explorer',
+    'World Moderation',
+    'Settings',
+    'Debug',
+    'About'
   ];
 
   // Global join-driven group watch batching (runs regardless of active tab)
@@ -40,17 +51,25 @@
       const res: any = await invoke('list_group_access_tokens');
       tokens = (Array.isArray(res) ? res : []).map((g: any) => String(g.token || '')).filter((t: string) => t.length >= 32);
     } catch {}
-    if (tokens.length === 0) return;
+    if (tokens.length === 0) {
+      pushDebug('[group-watch] abort :: no tokens available');
+      return;
+    }
 
     const API_BASE: string = (import.meta as any)?.env?.VITE_API_BASE || 'https://fch-toolkit.com';
     try {
       console.debug('[group-batch] sending', { userIdsCount: userIds.length, tokensCount: tokens.length });
+      pushDebug(`[group-watch] batch start :: users=${userIds.length} tokens=${tokens.length}`);
       const resp = await fetch(`${API_BASE}/check-user`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userIds, tokens }) });
-      if (!resp.ok) return;
+      if (!resp.ok) {
+        pushDebug(`[group-watch] server responded ${resp.status} ${resp.statusText}`);
+        return;
+      }
       const data: any = await resp.json();
       if (data && (Array.isArray(data.matches) || Array.isArray(data.aggregates))) {
         // Merge into global cache for hydration when tabs mount later
         try {
+          pushDebug(`[group-watch] received matches=${(data.matches || []).length} aggregates=${(data.aggregates || []).length}`);
           const w: any = window as any;
           const cache = w.__FCH_GROUP_WATCH_CACHE__ || { flags: {}, matchesByUser: {}, aggregates: {} };
           for (const m of (data.matches || [])) {
@@ -76,30 +95,50 @@
           const matchedUserIds = Array.from(new Set((data.matches || []).filter((m: any) => Boolean(m.watchlist)).map((m: any) => String(m.user_id))));
           if (matchedUserIds.length > 0) {
             console.debug('[sound] group_watchlist', { matchedCount: matchedUserIds.length, userIds: matchedUserIds });
-            try { await invoke('preview_sound'); } catch {}
+            pushDebug(`[group-watch] playing group sound for ${matchedUserIds.length} user(s)`);
+            try { await invoke('preview_group_sound'); } catch (err) { pushDebug(`[group-watch] group sound failed :: ${err}`); }
           }
         } catch {}
         // Persist group flags in DB for join logs backfill (no sound here)
         try {
           const matchedUserIds = Array.from(new Set((data.matches || []).filter((m: any) => Boolean(m.watchlist)).map((m: any) => String(m.user_id))));
           if (matchedUserIds.length > 0) {
-            await invoke('set_group_watchlisted_for_users', { userIds: matchedUserIds });
+            try {
+              const changed = await invoke<number>('set_group_watchlisted_for_users', { userIds: matchedUserIds });
+              pushDebug(`[group-watch] persisted watch flags for ${matchedUserIds.length} user(s) :: rowsUpdated=${changed}`);
+            } catch (err) {
+              pushDebug(`[group-watch] failed to persist watch flags :: ${err}`);
+            }
           }
         } catch {}
         // Broadcast results so UI (Instance Monitor) can update flags if mounted
         try {
           const evt = new CustomEvent('group_watch_results', { detail: { matches: data.matches || [], aggregates: data.aggregates || [] } });
           window.dispatchEvent(evt);
+          pushDebug(`[group-watch] dispatched results event`);
         } catch {}
       }
-    } catch {}
+    } catch (err) {
+      pushDebug(`[group-watch] batch error :: ${err}`);
+    }
   }
 
   onMount(() => {
     let unlistenInserted: undefined | (() => void);
     let unlistenSound: undefined | (() => void);
+    let unlistenDebug: undefined | (() => void);
+    let unlistenApiQueue: undefined | (() => void);
+    let unsubscribeApiResults: undefined | (() => void);
     (async () => {
       try { await invoke('start_log_watcher'); } catch {}
+      pushDebug('[VRCAPI] apiChecks ready (HTTP mode)');
+      unsubscribeApiResults = getResultsStore().subscribe((entries) => {
+        const latest = entries[entries.length - 1];
+        if (!latest) return;
+        pushDebug(
+          `[VRCAPI] apiChecks completed :: ${latest.file_id} v${latest.version} :: success=${latest.success}`
+        );
+      });
       try {
         const { listen } = await import('@tauri-apps/api/event');
         // On startup, dedupe open joins and proactively check current live users
@@ -120,12 +159,63 @@
             scheduleBatchWatchCheck();
           }
         });
+        unlistenApiQueue = await listen('api_queue_length', (event: any) => {
+          const len = Number(event?.payload ?? 0);
+          setApiQueueLength(Number.isFinite(len) ? len : 0);
+        });
         unlistenSound = await listen('sound_triggered', (e: any) => {
-          console.debug('[sound] local_watchlist', e?.payload || {});
+          const payload = e?.payload || {};
+          console.debug('[sound] local_watchlist', payload);
+          pushDebug(`[sound] local watch triggered :: ${JSON.stringify(payload)}`);
+        });
+        unlistenDebug = await listen('debug_log', (e: any) => {
+          const { message, ts } = e?.payload || {};
+          if (typeof message === 'string') {
+            pushDebug(message, typeof ts === 'string' ? ts : undefined);
+          }
+        });
+        await listen('api_checks_result', async (e: any) => {
+          const payload = e?.payload;
+          if (!payload || typeof payload !== 'object') return;
+
+          const normalized = Object.entries(payload).reduce((acc, [key, value]) => {
+            const camelKey = key.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+            acc[camelKey] = value;
+            return acc;
+          }, {} as Record<string, unknown>);
+
+          pushDebug(
+            `[avatarData] file=${String((normalized as any).fileId ?? '')} v=${String((normalized as any).version ?? '')} :: file=${JSON.stringify((normalized as any).file ?? null)} :: security=${JSON.stringify((normalized as any).security ?? null)}`
+          );
+
+          pushResult({
+            file_id: String((normalized as any).fileId ?? ''),
+            version: Number((normalized as any).version ?? 0),
+            success: Boolean((normalized as any).success !== false),
+            errors: Array.isArray((normalized as any).errors)
+              ? ((normalized as any).errors as string[])
+              : (normalized as any).error
+              ? [String((normalized as any).error)]
+              : undefined,
+            timestamp:
+              typeof (normalized as any).timestamp === 'string'
+                ? (normalized as any).timestamp
+                : undefined,
+            file: (normalized as any).file,
+            security: (normalized as any).security,
+            raw: payload,
+          });
         });
       } catch {}
     })();
-    return () => { try { unlistenInserted && unlistenInserted(); unlistenSound && unlistenSound(); } catch {} };
+    return () => { try {
+      if (batchTimer) clearInterval(batchTimer);
+      if (unlistenApiQueue) unlistenApiQueue();
+      unsubscribeApiResults?.();
+      unlistenInserted?.();
+      unlistenSound?.();
+      unlistenDebug?.();
+    } catch {} };
   });
 </script>
 
@@ -153,9 +243,17 @@
         {#key activeIndex}
           <LogExplorer/>
         {/key}
+      {:else if activeIndex === 4}
+        {#key activeIndex}
+          <WorldModeration/>
+        {/key}
       {:else if activeIndex === 5}
         {#key activeIndex}
           <SettingsPanel/>
+        {/key}
+      {:else if activeIndex === 6}
+        {#key activeIndex}
+          <DebugPanel/>
         {/key}
       {:else}
         <div class="placeholder">

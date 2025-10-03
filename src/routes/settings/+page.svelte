@@ -3,14 +3,29 @@
   import { invoke } from '@tauri-apps/api/core';
   let soundPath = $state<string | null>(null);
   let volume = $state(1.0);
+  let groupSoundPath = $state<string | null>(null);
+  let groupVolume = $state(1.0);
   let saveTimer: any;
 
   onMount(async () => {
-    try { const res: any = await invoke('get_config'); soundPath = (res && res.soundPath) || null; volume = (res && typeof res.soundVolume === 'number') ? res.soundVolume : 1.0; } catch {}
+    try {
+      const res: any = await invoke('get_config');
+      soundPath = (res && res.soundPath) || null;
+      volume = (res && typeof res.soundVolume === 'number') ? res.soundVolume : 1.0;
+      groupSoundPath = (res && res.groupSoundPath) || null;
+      groupVolume = (res && typeof res.groupSoundVolume === 'number') ? res.groupSoundVolume : 1.0;
+    } catch {}
   });
 
   async function saveNow() {
-    try { await invoke('set_config', { soundPath, soundVolume: volume }); } catch {}
+    try {
+      await invoke('set_config', {
+        soundPath,
+        soundVolume: volume,
+        groupSoundPath,
+        groupSoundVolume: groupVolume
+      });
+    } catch {}
   }
   function scheduleSave() {
     clearTimeout(saveTimer);
@@ -20,7 +35,11 @@
     try { const res: any = await invoke('browse_sound'); const p = (res && res.path) || null; if (p) { soundPath = p; scheduleSave(); } } catch {}
   }
   async function preview() {
-    try { await invoke('preview_sound'); } catch {}
+    try { await invoke('preview_watch_sound'); } catch {}
+  }
+
+  async function previewGroup() {
+    try { await invoke('preview_group_sound'); } catch {}
   }
 </script>
 
@@ -38,6 +57,22 @@
     <div class="row">
       <label for="vol">Volume</label>
       <input id="vol" type="range" min="0" max="1" step="0.01" bind:value={volume} oninput={scheduleSave} />
+    </div>
+  </fieldset>
+
+  <fieldset class="capsule">
+    <legend>Group Watchlist Notification Sound</legend>
+    <div class="row">
+      <label for="group-sound">File (WAV/MP3, blank for system sound)</label>
+      <div class="row-in">
+        <input id="group-sound" placeholder="C:\\path\\to\\group.(wav|mp3)" bind:value={groupSoundPath} oninput={scheduleSave} />
+        <button onclick={async () => { try { const res: any = await invoke('browse_sound'); const p = (res && res.path) || null; if (p) { groupSoundPath = p; scheduleSave(); } } catch {} }}>Browse</button>
+        <button onclick={previewGroup}>Preview</button>
+      </div>
+    </div>
+    <div class="row">
+      <label for="group-vol">Volume</label>
+      <input id="group-vol" type="range" min="0" max="1" step="0.01" bind:value={groupVolume} oninput={scheduleSave} />
     </div>
   </fieldset>
 </div>
