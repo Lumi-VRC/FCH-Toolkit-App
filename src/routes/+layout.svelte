@@ -1,9 +1,9 @@
 <script lang="ts">
-  import Sidebar from '$lib/components/Sidebar.svelte';
-  import LoginPage from './+page.svelte';
-  import InstanceMonitor from './instance-monitor/+page.svelte';
-  import LogExplorer from './log-explorer/+page.svelte';
-  import DatabasePage from './database/+page.svelte';
+import Sidebar from '$lib/components/Sidebar.svelte';
+import LoginPage from './+page.svelte';
+import InstanceMonitor from './instance-monitor/+page.svelte';
+import LogExplorer from './log-explorer/+page.svelte';
+import DatabasePage from './database/+page.svelte';
 import SettingsPanel from './settings/+page.svelte';
 import DebugPanel from './debug/+page.svelte';
 import WorldModeration from './world-moderation/+page.svelte';
@@ -17,16 +17,18 @@ import { getResultsStore, pushResult } from '$lib/stores/apiChecks';
   function toggleSidebar() { collapsed = !collapsed; }
   function selectTab(i: number) { activeIndex = i; }
 
-  const tabTitles = [
-    'Login',
-    'Instance Monitor',
-    'Database',
-    'Log Explorer',
-    'World Moderation',
-    'Settings',
-    'Debug',
-    'About'
-  ];
+const tabs = [
+  { title: 'Login', component: LoginPage },
+  { title: 'Instance Monitor', component: InstanceMonitor },
+  { title: 'Database', component: DatabasePage },
+  { title: 'Log Explorer', component: LogExplorer },
+  { title: 'World Moderation', component: WorldModeration },
+  { title: 'Settings', component: SettingsPanel },
+  { title: 'Debug', component: DebugPanel },
+  { title: 'About', component: null }
+];
+
+const tabTitles = tabs.map((tab) => tab.title);
 
   // Global join-driven group watch batching (runs regardless of active tab)
   let joinBatch = $state(new Set<string>());
@@ -227,39 +229,21 @@ import { getResultsStore, pushResult } from '$lib/stores/apiChecks';
       <h1>{tabTitles[activeIndex]}</h1>
     </header>
     <section class="content">
-      {#if activeIndex === 0}
-        {#key activeIndex}
-          <LoginPage/>
-        {/key}
-      {:else if activeIndex === 1}
-        {#key activeIndex}
-          <InstanceMonitor/>
-        {/key}
-      {:else if activeIndex === 2}
-        {#key activeIndex}
-          <DatabasePage/>
-        {/key}
-      {:else if activeIndex === 3}
-        {#key activeIndex}
-          <LogExplorer/>
-        {/key}
-      {:else if activeIndex === 4}
-        {#key activeIndex}
-          <WorldModeration/>
-        {/key}
-      {:else if activeIndex === 5}
-        {#key activeIndex}
-          <SettingsPanel/>
-        {/key}
-      {:else if activeIndex === 6}
-        {#key activeIndex}
-          <DebugPanel/>
-        {/key}
-      {:else}
-        <div class="placeholder">
-          <p>Content for <strong>{tabTitles[activeIndex]}</strong> will appear here.</p>
+      {#each tabs as tab, index}
+        <div
+          class="tab"
+          class:active={activeIndex === index}
+          aria-hidden={activeIndex === index ? undefined : 'true'}
+        >
+          {#if tab.component}
+            <svelte:component this={tab.component} />
+          {:else}
+            <div class="placeholder">
+              <p>Content for <strong>{tab.title}</strong> will appear here.</p>
+            </div>
+          {/if}
         </div>
-      {/if}
+      {/each}
     </section>
   </main>
 </div>
@@ -286,7 +270,10 @@ import { getResultsStore, pushResult } from '$lib/stores/apiChecks';
   }
   header h1 { margin: 0; font-size: 15px; font-weight: 600; color: var(--fg); }
 
-  .content { flex: 1; overflow: auto; padding: 16px; }
+  .content { flex: 1; overflow: hidden; padding: 16px; position: relative; }
+
+  .tab { display: none; height: 100%; overflow: auto; }
+  .tab.active { display: block; }
 
   .placeholder {
     margin-top: 16px;

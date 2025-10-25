@@ -275,103 +275,186 @@ async fn log_watch_loop(app: tauri::AppHandle) -> Result<()> {
                                             }
                                         }
                                         let lines: Vec<&str> = text.split('\n').collect();
-                                        // Find last "Joining wrld..."; starts a new instance section
+                                        // Find the most recent anchor: either a "Joining wrld_..." line or a "Successfully joined room"
                                         let last_joining_idx = lines.iter().rposition(|raw| {
                                             re_joining.is_match(raw.trim_end_matches('\r'))
                                         });
-                                        if let Some(start_idx) = last_joining_idx {
-                                            // If the log shows a clean purge after joining, skip backfill
-                                            let purged_after_join =
-                                                lines[start_idx + 1..].iter().any(|raw| {
-                                                    let line = raw.trim_end_matches('\r');
-                                                    re_purge1.is_match(line)
-                                                        || re_purge2.is_match(line)
-                                                        || re_purge3.is_match(line)
-                                                        || re_quit.is_match(line)
-                                                });
-                                            if !purged_after_join {
-                                                if let Some(joining_line) = lines.get(start_idx) {
+                                        let last_success_idx = lines.iter().rposition(|raw| {
+                                            re_purge3.is_match(raw.trim_end_matches('\r'))
+                                        });
+
+                                        let mut anchor: Option<(usize, bool)> = None; // (index, is_joining)
+                                        if let Some(idx) = last_joining_idx {
+                                            anchor = Some((idx, true));
+                                        }
+                                        if let Some(idx) = last_success_idx {
+                                            match anchor {
+                                                Some((prev_idx, _)) if idx > prev_idx => {
+                                                    anchor = Some((idx, false));
+                                                }
+                                                None => anchor = Some((idx, false)),
+                                                _ => {}
+                                            }
+                                        }
+
+                                        if let Some((start_idx, anchor_is_joining)) = anchor {
+                                            let mut purge_reason: Option<&'static str> = None;
+                                            let mut purged_after_anchor = false;
+                                            for raw in lines[start_idx + 1..].iter() {
+                                                let line = raw.trim_end_matches('\r');
+                                                if line.is_empty() {
+                                                    continue;
+                                                }
+                                                if re_purge1.is_match(line) {
+                                                    purge_reason = Some("Successfully left room");
+                                                    purged_after_anchor = true;
+                                                    break;
+                                                }
+                                                if re_purge2.is_match(line) {
+                                                    purge_reason = Some("VRCNP: Stopping server");
+                                                    purged_after_anchor = true;
+                                                    break;
+                                                }
+                                                if re_purge3.is_match(line) {
+                                                    // Only treat as purge if this is a subsequent success and we started from a join
+                                                    if anchor_is_joining {
+                                                        purge_reason = Some("Successfully joined room");
+                                                        purged_after_anchor = true;
+                                                        break;
+                                                    }
+                                                    // If we anchored on a success line already, a second success implies a new session started
+                                                    purge_reason = Some("Successfully joined room");
+                                                    purged_after_anchor = true;
+                                                    break;
+                                                }
+                                                if re_quit.is_match(line) {
+                                                    purge_reason = Some("Application quit");
+                                                    purged_after_anchor = true;
+                                                    break;
+                                                }
+                                            }
+
+                                            let anchor_line = lines[start_idx].trim_end_matches('\r');
+                                            let anchor_ts = re_ts
+                                                .captures(anchor_line)
+                                                .and_then(|c| c.get(1))
+                                                .map(|m| m.as_str());
+                                            if let Some(ts) = anchor_ts {
+                                                if anchor_is_joining {
                                                     if let Some(caps) =
-                                                        re_joining.captures(joining_line)
+                                                        re_joining.captures(anchor_line)
                                                     {
-                                                        if let Some(ts) = caps
-                                                            .get(0)
-                                                            .and_then(|m| {
-                                                                re_ts.captures(m.as_str())
-                                                            })
-                                                            .and_then(|c| c.get(1))
+                                                        let world_id = caps
+                                                            .get(1)
                                                             .map(|m| m.as_str())
-                                                        {
+                                                            .unwrap_or("");
+                                                        let instance_id = caps
+                                                            .get(2)
+                                                            .map(|m| m.as_str())
+                                                            .unwrap_or("");
+                                                        let region =
+                                                            caps.get(3).map(|m| m.as_str());
+
+                                                        if purged_after_anchor {
+                                                            emit_debug(
+                                                                &app,
+                                                                format!(
+                                                                    "Startup backfill skipped: purge marker '{:?}' detected after join at {ts} (world={world_id}, instance={instance_id}, region={:?})",
+                                                                    purge_reason,
+                                                                    region
+                                                                ),
+                                                            );
+                                                        } else {
+                                                            emit_debug(
+                                                                &app,
+                                                                format!(
+                                                                    "Startup backfill using join at {ts}: world={world_id}, instance={instance_id}, region={:?}",
+                                                                    region
+                                                                ),
+                                                            );
                                                             let _ = super::db::db_set_state(
                                                                 "last_instance_join_ts",
                                                                 ts,
                                                             );
-                                                            let world_id = caps
-                                                                .get(1)
-                                                                .map(|m| m.as_str())
-                                                                .unwrap_or("");
-                                                            let instance_id = caps
-                                                                .get(2)
-                                                                .map(|m| m.as_str())
-                                                                .unwrap_or("");
-                                                            let region =
-                                                                caps.get(3).map(|m| m.as_str());
                                                             // Record a system row so the paginated log view shows the transition
                                                             let msg = match region { Some(r) => format!("Joining: {} | Instance: {} | Region: {}", world_id, instance_id, r), None => format!("Joining: {} | Instance: {}", world_id, instance_id) };
-                                                            let _ =
-                                                                super::db::db_insert_system_event(
-                                                                    &app,
-                                                                    ts,
-                                                                    "instance_changed",
-                                                                    Some(&msg),
-                                                                    Some(world_id),
-                                                                    Some(instance_id),
-                                                                    region,
-                                                                    false,
-                                                                );
+                                                            let _ = super::db::db_insert_system_event(
+                                                                &app,
+                                                                ts,
+                                                                "instance_changed",
+                                                                Some(&msg),
+                                                                Some(world_id),
+                                                                Some(instance_id),
+                                                                region,
+                                                                false,
+                                                            );
                                                             emit_debug(&app, format!("Backfill instance window established at {ts} (world={world_id}, instance={instance_id}, region={:?}) during startup scan", region));
                                                         }
                                                     }
-                                                }
-                                                // Reconstruct who is still in the instance by replaying lines
-                                                for raw in &lines[start_idx + 1..] {
-                                                    let line = raw.trim_end_matches('\r');
-                                                    if line.is_empty() {
-                                                        continue;
+                                                } else {
+                                                    if purged_after_anchor {
+                                                        emit_debug(
+                                                            &app,
+                                                            format!(
+                                                                "Startup backfill skipped: purge marker '{:?}' detected after 'Successfully joined room' at {ts}",
+                                                                purge_reason
+                                                            ),
+                                                        );
+                                                    } else {
+                                                        emit_debug(
+                                                            &app,
+                                                            format!(
+                                                                "Startup backfill anchored to 'Successfully joined room' at {ts}"
+                                                            ),
+                                                        );
+                                                        let _ = super::db::db_set_state(
+                                                            "last_instance_join_ts",
+                                                            ts,
+                                                        );
                                                     }
-                                                    let ts = match re_ts
-                                                        .captures(line)
-                                                        .and_then(|c| c.get(1))
-                                                        .map(|m| m.as_str())
-                                                    {
-                                                        Some(t) => t,
-                                                        None => continue,
-                                                    };
-                                                    if let Some(caps) = re_join.captures(line) {
-                                                        let username = caps
-                                                            .get(1)
-                                                            .map(|m| m.as_str().trim())
-                                                            .unwrap_or("");
-                                                        let uid = caps
-                                                            .get(2)
-                                                            .map(|m| m.as_str())
-                                                            .unwrap_or("");
-                                                        if !uid.is_empty() {
-                                                            let _ = super::db::db_insert_join(
-                                                                &app, ts, uid, username, false,
-                                                            );
+                                                }
+
+                                                if !purged_after_anchor {
+                                                    // Reconstruct who is still in the instance by replaying lines
+                                                    for raw in &lines[start_idx + 1..] {
+                                                        let line = raw.trim_end_matches('\r');
+                                                        if line.is_empty() {
+                                                            continue;
                                                         }
-                                                    } else if let Some(caps) =
-                                                        re_left.captures(line)
-                                                    {
-                                                        let uid = caps
-                                                            .get(2)
+                                                        let ts = match re_ts
+                                                            .captures(line)
+                                                            .and_then(|c| c.get(1))
                                                             .map(|m| m.as_str())
-                                                            .unwrap_or("");
-                                                        if !uid.is_empty() {
-                                                            let _ = super::db::db_update_leave(
-                                                                &app, ts, uid, false,
-                                                            );
+                                                        {
+                                                            Some(t) => t,
+                                                            None => continue,
+                                                        };
+                                                        if let Some(caps) = re_join.captures(line) {
+                                                            let username = caps
+                                                                .get(1)
+                                                                .map(|m| m.as_str().trim())
+                                                                .unwrap_or("");
+                                                            let uid = caps
+                                                                .get(2)
+                                                                .map(|m| m.as_str())
+                                                                .unwrap_or("");
+                                                            if !uid.is_empty() {
+                                                                let _ = super::db::db_insert_join(
+                                                                    &app, ts, uid, username, false,
+                                                                );
+                                                            }
+                                                        } else if let Some(caps) =
+                                                            re_left.captures(line)
+                                                        {
+                                                            let uid = caps
+                                                                .get(2)
+                                                                .map(|m| m.as_str())
+                                                                .unwrap_or("");
+                                                            if !uid.is_empty() {
+                                                                let _ = super::db::db_update_leave(
+                                                                    &app, ts, uid, false,
+                                                                );
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -626,6 +709,21 @@ async fn log_watch_loop(app: tauri::AppHandle) -> Result<()> {
                                     || re_purge3.is_match(line)
                                     || re_quit.is_match(line)
                                 {
+                                    let loop_trigger = if re_purge1.is_match(line) {
+                                        "Successfully left room"
+                                    } else if re_purge2.is_match(line) {
+                                        "VRCNP: Stopping server"
+                                    } else if re_purge3.is_match(line) {
+                                        "Successfully joined room"
+                                    } else {
+                                        "Application quit"
+                                    };
+                                    emit_debug(
+                                        &app,
+                                        format!(
+                                            "Purge trigger detected at {ts}: reason='{loop_trigger}'"
+                                        ),
+                                    );
                                     last_api_call_id = None;
                                     if let Err(e) = super::db::db_purge_all(&app, ts, true) {
                                         eprintln!("[watcher] failed to purge all: {e:?}");
@@ -641,6 +739,13 @@ async fn log_watch_loop(app: tauri::AppHandle) -> Result<()> {
                                     let world_id = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                                     let instance_id = caps.get(2).map(|m| m.as_str()).unwrap_or("");
                                     let region = caps.get(3).map(|m| m.as_str());
+                                    let region_display = region.unwrap_or("auto");
+                                    emit_debug(
+                                        &app,
+                                        format!(
+                                            "World join detected at {ts}: world={world_id} instance={instance_id} region={region_display}"
+                                        ),
+                                    );
                                     let _ = app.emit("instance_changed", serde_json::json!({ "worldId": world_id, "instanceId": instance_id, "region": region, "ts": ts }));
                                     let msg = match region {
                                         Some(r) => format!(

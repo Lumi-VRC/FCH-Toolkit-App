@@ -36,6 +36,7 @@ use anyhow::Result;
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 use tauri::Emitter;
 
 // Compute the absolute path of the SQLite file so all modules share the same DB.
@@ -43,12 +44,18 @@ fn db_path() -> PathBuf {
     super::notes::notes_dir().join("joinlogs.db")
 }
 
+fn open_connection() -> rusqlite::Result<rusqlite::Connection> {
+    let conn = rusqlite::Connection::open(db_path())?;
+    conn.busy_timeout(Duration::from_secs(1))?;
+    Ok(conn)
+}
+
 // Create tables and add missing columns. Safe to call repeatedly, here because I kept having to remake the db manually.
 pub fn db_init() -> rusqlite::Result<()> {
     let p = db_path();
     // Ensure the parent directory exists on first run (same folder as notes/config)
     let _ = fs::create_dir_all(super::notes::notes_dir());
-    let conn = rusqlite::Connection::open(p)?;
+    let conn = open_connection()?;
     // Primary table: join rows and system rows live together, distinguished by
     // is_system (0 for players, 1 for system). We store join and optional leave
     // timestamps so we can reconstruct active users and browse history.
@@ -164,7 +171,7 @@ pub fn normalize_avatar_name(raw: &str) -> String {
 // Store an arbitrary key/value (e.g., last_instance_join_ts)
 pub fn db_set_state(key: &str, value: &str) -> Result<()> {
     db_init()?;
-    let conn = rusqlite::Connection::open(db_path())?;
+    let conn = open_connection()?;
     conn.execute(
         "INSERT OR REPLACE INTO app_state (key, value) VALUES (?1, ?2)",
         rusqlite::params![key, value],
@@ -176,7 +183,7 @@ pub fn db_set_state(key: &str, value: &str) -> Result<()> {
 // Retrieve a value previously written to app_state
 pub fn db_get_state(key: &str) -> Result<Option<String>> {
     db_init()?;
-    let conn = rusqlite::Connection::open(db_path())?;
+    let conn = open_connection()?;
     let mut stmt = conn.prepare("SELECT value FROM app_state WHERE key = ?1")?;
     let mut rows = stmt.query(rusqlite::params![key])?;
     if let Some(row) = rows.next()? {
@@ -209,7 +216,7 @@ pub fn _db_insert_event(
     if db_init().is_err() {
         return;
     }
-    if let Ok(conn) = rusqlite::Connection::open(db_path()) {
+    if let Ok(conn) = open_connection() {
         // OK :DDDDD
         let _ = conn.execute(
 			"INSERT OR IGNORE INTO join_log (user_id, username, join_timestamp, is_system, event_kind, world_id, instance_id) VALUES (?,?,?,?,?,?,?)",
@@ -235,7 +242,7 @@ pub fn db_insert_join(
         return Ok(());
     }
     db_init()?;
-    let conn = rusqlite::Connection::open(db_path())?;
+    let conn = open_connection()?;
     let mut stmt = conn.prepare("INSERT OR IGNORE INTO join_log (user_id, username, join_timestamp, is_system, event_kind) VALUES (?, ?, ?, 0, 'join')")?;
     let changed = stmt.execute(rusqlite::params![user_id, username, ts])?;
     let id = conn.last_insert_rowid();
@@ -272,7 +279,7 @@ pub fn db_update_leave(app: &tauri::AppHandle, ts: &str, user_id: &str, emit: bo
         return Ok(());
     }
     db_init()?;
-    let conn = rusqlite::Connection::open(db_path())?;
+    let conn = open_connection()?;
     let mut stmt = conn.prepare("SELECT id FROM join_log WHERE user_id = ? AND leave_timestamp IS NULL AND is_system = 0 ORDER BY join_timestamp DESC LIMIT 1")?;
     let mut rows = stmt.query(rusqlite::params![user_id])?;
     if let Some(row) = rows.next()? {
@@ -314,7 +321,7 @@ pub fn db_update_leave_by_username(
         return Ok(());
     }
     db_init()?;
-    let conn = rusqlite::Connection::open(db_path())?;
+    let conn = open_connection()?;
     let mut stmt = conn.prepare(
         "SELECT id, user_id FROM join_log WHERE username = ?1 AND leave_timestamp IS NULL AND is_system = 0 ORDER BY join_timestamp DESC LIMIT 1"
     )?;
@@ -362,7 +369,7 @@ pub fn db_insert_system_event(
         return Ok(());
     }
     db_init()?;
-    let conn = rusqlite::Connection::open(db_path())?;
+    let conn = open_connection()?;
     let mut stmt = conn.prepare("INSERT INTO join_log (user_id, username, join_timestamp, is_system, event_kind, message, world_id, instance_id, region) VALUES ('system', NULL, ?, 1, ?, ?, ?, ?, ?)")?;
     let _ = stmt.execute(rusqlite::params![
         ts,
@@ -403,7 +410,7 @@ pub fn db_purge_all(app: &tauri::AppHandle, ts: &str, emit: bool) -> Result<()> 
         return Ok(());
     }
     db_init()?;
-    let conn = rusqlite::Connection::open(db_path())?;
+    let conn = open_connection()?;
     conn.execute(
         "UPDATE join_log SET leave_timestamp = ? WHERE leave_timestamp IS NULL AND is_system = 0",
         rusqlite::params![ts],
@@ -422,7 +429,7 @@ pub fn db_purge_all(app: &tauri::AppHandle, ts: &str, emit: bool) -> Result<()> 
 #[tauri::command]
 pub fn dedupe_open_joins(app: tauri::AppHandle) -> Result<usize, String> {
     db_init().map_err(|e| e.to_string())?;
-    let conn = rusqlite::Connection::open(db_path()).map_err(|e| e.to_string())?;
+    let conn = open_connection().map_err(|e| e.to_string())?;
     // Find users with multiple open rows
     let mut stmt = conn.prepare("SELECT user_id FROM join_log WHERE leave_timestamp IS NULL AND is_system = 0 GROUP BY user_id HAVING COUNT(*) > 1").map_err(|e| e.to_string())?;
     let user_ids = stmt
@@ -474,7 +481,7 @@ pub fn set_group_watchlisted_for_users(user_ids: Vec<String>) -> Result<usize, S
         return Ok(0);
     }
     db_init().map_err(|e| e.to_string())?;
-    let conn = rusqlite::Connection::open(db_path()).map_err(|e| e.to_string())?;
+    let conn = open_connection().map_err(|e| e.to_string())?;
     let since = super::db::db_get_state("last_instance_join_ts").unwrap_or(None);
     let placeholders = (0..user_ids.len())
         .map(|_| "?")
@@ -506,7 +513,7 @@ pub fn set_group_watchlisted_for_users(user_ids: Vec<String>) -> Result<usize, S
 #[tauri::command]
 pub fn get_join_logs_page(offset: i64, limit: i64) -> Result<Vec<serde_json::Value>, String> {
     db_init().map_err(|e| e.to_string())?;
-    let conn = rusqlite::Connection::open(db_path()).map_err(|e| e.to_string())?;
+    let conn = open_connection().map_err(|e| e.to_string())?;
     let mut stmt = conn.prepare("SELECT id, user_id, username, join_timestamp, leave_timestamp, is_system, event_kind, message, world_id, instance_id, region, group_watchlisted FROM join_log ORDER BY join_timestamp DESC LIMIT ?2 OFFSET ?1").map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(rusqlite::params![offset, limit], |row| {
@@ -550,7 +557,7 @@ pub fn add_group_access_token(
         return Err("Missing group or token".into());
     }
     db_init().map_err(|e| e.to_string())?;
-    let conn = rusqlite::Connection::open(db_path()).map_err(|e| e.to_string())?;
+    let conn = open_connection().map_err(|e| e.to_string())?;
     conn.execute(
         "INSERT OR REPLACE INTO group_access (group_id, group_name, access_token) VALUES (?1, ?2, ?3)",
         rusqlite::params![group_id, group_name, token]
@@ -561,7 +568,7 @@ pub fn add_group_access_token(
 #[tauri::command]
 pub fn list_group_access_tokens() -> Result<Vec<serde_json::Value>, String> {
     db_init().map_err(|e| e.to_string())?;
-    let conn = rusqlite::Connection::open(db_path()).map_err(|e| e.to_string())?;
+    let conn = open_connection().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
             "SELECT group_id, group_name, access_token FROM group_access ORDER BY group_name ASC",
@@ -687,7 +694,7 @@ pub fn db_insert_avatar_log(
         return Ok(());
     }
     db_init()?;
-    let conn = rusqlite::Connection::open(db_path())?;
+    let conn = open_connection()?;
     conn.execute(
         "INSERT INTO avatar_logs (timestamp, username, avatar_name) VALUES (?1, ?2, ?3)",
         rusqlite::params![ts, username, avatar_name],
@@ -722,7 +729,7 @@ pub fn db_insert_avatar_details(
         owner_id
     };
     db_init()?;
-    let conn = rusqlite::Connection::open(db_path())?;
+    let conn = open_connection()?;
     if trimmed_input != normalized {
         let _ = conn.execute(
             "DELETE FROM avatar_details WHERE avatar_name = ?1 AND owner_id = ?2",
@@ -772,7 +779,7 @@ pub fn db_get_avatar_details(avatar_name: String) -> Result<Vec<serde_json::Valu
         return Ok(Vec::new());
     }
     db_init().map_err(|e| e.to_string())?;
-    let conn = rusqlite::Connection::open(db_path()).map_err(|e| e.to_string())?;
+    let conn = open_connection().map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     let mut stmt = conn
         .prepare(
@@ -835,7 +842,7 @@ pub fn db_get_avatar_details(avatar_name: String) -> Result<Vec<serde_json::Valu
 #[tauri::command]
 pub fn list_recent_avatar_details(limit: Option<i64>) -> Result<Vec<serde_json::Value>, String> {
     db_init().map_err(|e| e.to_string())?;
-    let conn = rusqlite::Connection::open(db_path()).map_err(|e| e.to_string())?;
+    let conn = open_connection().map_err(|e| e.to_string())?;
     let lim = limit.unwrap_or(10).max(1);
     let mut stmt = conn
         .prepare(
@@ -905,7 +912,7 @@ pub fn list_distinct_avatar_details(
     search: Option<String>,
 ) -> Result<serde_json::Value, String> {
     db_init().map_err(|e| e.to_string())?;
-    let conn = rusqlite::Connection::open(db_path()).map_err(|e| e.to_string())?;
+    let conn = open_connection().map_err(|e| e.to_string())?;
 
     let lim = limit.unwrap_or(100).max(1);
     let off = offset.unwrap_or(0).max(0);
