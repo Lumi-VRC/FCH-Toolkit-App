@@ -298,11 +298,12 @@
         for (const m of (payload.matches || [])) {
           const uid = String(m.user_id);
           const watchlist = Boolean(m.watchlist);
+          const notifications = Boolean(m.notifications);
           const notes = m.notes ? String(m.notes) : undefined;
           const prev = map.get(uid);
           map.set(uid, { watchlist: (prev?.watchlist || watchlist), notes: prev?.notes || notes });
           const arr = perUserMatches.get(uid) || [];
-          arr.push({ group_id: String(m.group_id), groupName: m.groupName, notes, watchlist });
+          arr.push({ group_id: String(m.group_id), groupName: m.groupName, notes, watchlist, notifications });
           perUserMatches.set(uid, arr);
         }
         watchFlags = map;
@@ -380,6 +381,9 @@
   onMount(() => {
     const unsubs: Array<() => void> = [];
     let pollTimer: number | undefined;
+    let hydrateTimer: number | undefined;
+    let hydrationInFlight = false;
+    let initialHydrated = false;
     const handleGroupResults = (ev: any) => {
       const d = ev?.detail;
       if (!d) return;
@@ -395,46 +399,65 @@
       } catch {}
     })();
 
-    (async () => {
-      try { await invoke('start_log_watcher'); } catch(e) { console.error("Failed to start log watcher", e); }
+    async function hydrateActiveUsers(source: string) {
+      if (initialHydrated || hydrationInFlight) return;
+      hydrationInFlight = true;
+      let succeeded = false;
+      try {
+        const initialActive: any[] = await invoke('get_active_join_logs');
+        const latestByUser = new Map<string, any>();
+        for (const row of initialActive) {
+          const uid = String(row.userId);
+          const prev = latestByUser.get(uid);
+          if (!prev || String(row.joinedAt || '') > String(prev.joinedAt || '')) {
+            latestByUser.set(uid, row);
+          }
+        }
+        const deduped = Array.from(latestByUser.values());
+        activeUsers = deduped.map((l) => ({ ...l, type: 'user' }));
+        setLiveViewCounts(avatarPerf.size, activeUsers.length);
+        pushDebug(`Backfilled ${activeUsers.length} active user(s) via ${source}`);
+        void pollAvatarStatus();
+        const duplicates = initialActive.filter((r) => {
+          const latest = latestByUser.get(String(r.userId));
+          return !latest || String(r.joinedAt || '') < String(latest?.joinedAt || '');
+        });
+        if (duplicates.length > 0) {
+          const ts = String((initialActive[initialActive.length - 1]?.joinedAt) || '');
+          for (const d of duplicates) {
+            try {
+              await invoke('db_update_leave', { ts, userId: d.userId });
+            } catch {}
+          }
+        }
+        console.debug('Loaded initial active users from DB', { count: activeUsers.length, source });
+        applyGroupWatchResults({ matches: [], aggregates: [] });
+        initialHydrated = true;
+        succeeded = true;
+      } catch (e) {
+        console.error('Failed to get active join logs', e);
+        hydrationInFlight = false;
+        return;
+      } finally {
+        if (!succeeded) {
+          hydrationInFlight = false;
+        }
+      }
+      hydrationInFlight = false;
+    }
 
+    (async () => {
       const { listen } = await import('@tauri-apps/api/event');
 
       const unlistenReady = await listen('watcher_ready', async () => {
         console.debug('[event:watcher_ready] Watcher is ready, fetching initial data.');
         unlistenReady();
-        
-        try {
-          const initialActive: any[] = await invoke('get_active_join_logs');
-          // Deduplicate by userId: keep most recent join, mark others as left
-          const latestByUser = new Map<string, any>();
-          for (const row of initialActive) {
-            const uid = String(row.userId);
-            const prev = latestByUser.get(uid);
-            if (!prev || String(row.joinedAt || '') > String(prev.joinedAt || '')) {
-              latestByUser.set(uid, row);
-            }
-          }
-          const deduped = Array.from(latestByUser.values());
-          activeUsers = deduped.map(l => ({ ...l, type: 'user' }));
-          setLiveViewCounts(avatarPerf.size, activeUsers.length);
-          pushDebug(`Backfilled ${activeUsers.length} active user(s) on watcher ready`);
-          void pollAvatarStatus();
-          const duplicates = initialActive.filter(r => !latestByUser.get(String(r.userId)) || String(r.joinedAt || '') < String(latestByUser.get(String(r.userId))?.joinedAt || ''));
-          if (duplicates.length > 0) {
-            const ts = String((initialActive[initialActive.length-1]?.joinedAt) || '');
-            for (const d of duplicates) {
-              try { await invoke('db_update_leave', { ts, userId: d.userId }); } catch {}
-            }
-          }
-          console.debug('Loaded initial active users from DB', { count: activeUsers.length });
-          // Hydrate group flags from cache immediately (if any)
-          applyGroupWatchResults({ matches: [], aggregates: [] });
-        } catch(e) {
-          console.error("Failed to get active join logs", e);
-        }
+        await hydrateActiveUsers('watcher_ready');
       });
       unsubs.push(unlistenReady);
+
+      // Safety net: hydrate once shortly after mount in case watcher_ready fired before we mounted.
+      hydrateTimer = window.setTimeout(() => { void hydrateActiveUsers('delayed_hydrate'); }, 250);
 
       unsubs.push(await listen('db_row_inserted', (e: any) => {
         console.debug('[event:db_row_inserted]', e);
@@ -520,6 +543,7 @@
       unsubs.forEach((u) => typeof u === 'function' && u());
       window.removeEventListener('group_watch_results', handleGroupResults as any);
       if (pollTimer) clearInterval(pollTimer);
+      if (hydrateTimer) clearTimeout(hydrateTimer);
     };
   });
 </script>
@@ -724,7 +748,7 @@
           {#each showWatchModal.items as it}
             <div class="gw-item">
               <div class="gw-line"><strong>{it.groupName || it.group_id}</strong></div>
-              <div class="gw-line">Notifications: - {it.watchlist ? 'On' : 'Off'}</div>
+              <div class="gw-line">Notifications: - {it.notifications ? 'On' : 'Off'}</div>
               <div class="gw-note">{it.notes || '—'}</div>
               <hr />
             </div>

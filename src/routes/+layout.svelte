@@ -7,10 +7,11 @@ import DatabasePage from './database/+page.svelte';
 import SettingsPanel from './settings/+page.svelte';
 import DebugPanel from './debug/+page.svelte';
 import WorldModeration from './world-moderation/+page.svelte';
-import { onMount } from 'svelte';
+import { onDestroy, onMount } from 'svelte';
 import { invoke } from '@tauri-apps/api/core';
 import { pushDebug, setApiQueueLength } from '$lib/stores/debugLog';
 import { getResultsStore, pushResult } from '$lib/stores/apiChecks';
+import { markLiveViewListenersReady, waitForLiveViewListenersReady } from '$lib/liveViewReady';
   let collapsed = $state(true);
   let activeIndex = $state(0);
 
@@ -130,30 +131,24 @@ const tabTitles = tabs.map((tab) => tab.title);
     let unlistenSound: undefined | (() => void);
     let unlistenDebug: undefined | (() => void);
     let unlistenApiQueue: undefined | (() => void);
+    let unlistenApiResults: undefined | (() => void);
+    const teardown: Array<() => void | Promise<void>> = [];
     let unsubscribeApiResults: undefined | (() => void);
     (async () => {
-      try { await invoke('start_log_watcher'); } catch {}
-      pushDebug('[VRCAPI] apiChecks ready (HTTP mode)');
-      unsubscribeApiResults = getResultsStore().subscribe((entries) => {
-        const latest = entries[entries.length - 1];
-        if (!latest) return;
-        pushDebug(
-          `[VRCAPI] apiChecks completed :: ${latest.file_id} v${latest.version} :: success=${latest.success}`
-        );
-      });
       try {
         const { listen } = await import('@tauri-apps/api/event');
-        // On startup, dedupe open joins and proactively check current live users
-        try { await invoke('dedupe_open_joins'); } catch {}
-        try {
-          const initial: any[] = await invoke('get_active_join_logs');
-          const userIds = Array.from(new Set((Array.isArray(initial)?initial:[]).map((r:any)=>String(r.userId)).filter(Boolean)));
-          if (userIds.length > 0) {
-            // Reuse batch flow by inserting into the batch and flushing immediately
-            userIds.forEach(uid => joinBatch.add(uid));
-            await flushJoinBatch();
-          }
-        } catch {}
+        const ensureUnsub = (handler: () => void | Promise<void>) => {
+          let removed = false;
+          return async () => {
+            if (!removed) {
+              removed = true;
+              try {
+                await handler();
+              } catch {}
+            }
+          };
+        };
+
         unlistenInserted = await listen('db_row_inserted', (e: any) => {
           const p = e?.payload || {};
           if (p && !p.type && p.userId) {
@@ -161,22 +156,30 @@ const tabTitles = tabs.map((tab) => tab.title);
             scheduleBatchWatchCheck();
           }
         });
+        teardown.push(ensureUnsub(unlistenInserted));
+
         unlistenApiQueue = await listen('api_queue_length', (event: any) => {
           const len = Number(event?.payload ?? 0);
           setApiQueueLength(Number.isFinite(len) ? len : 0);
         });
+        teardown.push(ensureUnsub(unlistenApiQueue));
+
         unlistenSound = await listen('sound_triggered', (e: any) => {
           const payload = e?.payload || {};
           console.debug('[sound] local_watchlist', payload);
           pushDebug(`[sound] local watch triggered :: ${JSON.stringify(payload)}`);
         });
+        teardown.push(ensureUnsub(unlistenSound));
+
         unlistenDebug = await listen('debug_log', (e: any) => {
           const { message, ts } = e?.payload || {};
           if (typeof message === 'string') {
             pushDebug(message, typeof ts === 'string' ? ts : undefined);
           }
         });
-        await listen('api_checks_result', async (e: any) => {
+        teardown.push(ensureUnsub(unlistenDebug));
+
+        unlistenApiResults = await listen('api_checks_result', async (e: any) => {
           const payload = e?.payload;
           if (!payload || typeof payload !== 'object') return;
 
@@ -208,16 +211,51 @@ const tabTitles = tabs.map((tab) => tab.title);
             raw: payload,
           });
         });
+        teardown.push(ensureUnsub(unlistenApiResults));
+
+        markLiveViewListenersReady();
+      } catch {}
+
+      await waitForLiveViewListenersReady();
+
+      try {
+        await invoke('start_log_watcher');
+      } catch {}
+      pushDebug('[VRCAPI] apiChecks ready (HTTP mode)');
+      unsubscribeApiResults = getResultsStore().subscribe((entries) => {
+        const latest = entries[entries.length - 1];
+        if (!latest) return;
+        pushDebug(
+          `[VRCAPI] apiChecks completed :: ${latest.file_id} v${latest.version} :: success=${latest.success}`
+        );
+      });
+      try { await invoke('dedupe_open_joins'); } catch {}
+      try {
+        const initial: any[] = await invoke('get_active_join_logs');
+        const userIds = Array.from(new Set((Array.isArray(initial) ? initial : []).map((r: any) => String(r.userId)).filter(Boolean)));
+        if (userIds.length > 0) {
+          userIds.forEach((uid) => joinBatch.add(uid));
+          await flushJoinBatch();
+        }
       } catch {}
     })();
-    return () => { try {
-      if (batchTimer) clearInterval(batchTimer);
-      if (unlistenApiQueue) unlistenApiQueue();
-      unsubscribeApiResults?.();
-      unlistenInserted?.();
-      unlistenSound?.();
-      unlistenDebug?.();
-    } catch {} };
+    onDestroy(async () => {
+      try {
+        if (batchTimer) clearTimeout(batchTimer);
+        unsubscribeApiResults?.();
+        const tasks = [...teardown];
+        if (unlistenApiQueue) tasks.push(unlistenApiQueue);
+        if (unlistenInserted) tasks.push(unlistenInserted);
+        if (unlistenSound) tasks.push(unlistenSound);
+        if (unlistenDebug) tasks.push(unlistenDebug);
+        if (unlistenApiResults) tasks.push(unlistenApiResults);
+        for (const task of tasks) {
+          try {
+            await task();
+          } catch {}
+        }
+      } catch {}
+    });
   });
 </script>
 

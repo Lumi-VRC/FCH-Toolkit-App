@@ -12,7 +12,7 @@ vite.config.ts.timestamp-*
 .cursor/commands
 .cursor/*
 .vscode
-
+SetVersion.bat
 # Logs
 *.log
 
