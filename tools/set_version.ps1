@@ -19,7 +19,7 @@ function Replace-VersionJson {
         throw "Version field not found in $Path"
     }
     $updated = [Regex]::Replace($content, $pattern, '"version": "' + $New + '"', 1)
-    Set-Content -Path $Path -Value $updated -Encoding UTF8
+    [System.IO.File]::WriteAllText($Path, $updated, [System.Text.UTF8Encoding]::new($false))
     Write-Host "Updated $Path"
 }
 
@@ -36,7 +36,7 @@ function Replace-VersionToml {
         throw "Version field not found in $Path"
     }
     $updated = [Regex]::Replace($content, $pattern, 'version = "' + $New + '"', 1)
-    Set-Content -Path $Path -Value $updated -Encoding UTF8
+    [System.IO.File]::WriteAllText($Path, $updated, [System.Text.UTF8Encoding]::new($false))
     Write-Host "Updated $Path"
 }
 

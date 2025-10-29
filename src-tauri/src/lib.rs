@@ -74,6 +74,8 @@ pub fn run() {
             db::list_recent_avatar_details,
             db::list_distinct_avatar_details,
             db::list_recent_avatar_logs,
+            db::get_media_items,
+            db::clear_media_items,
             // Startup maintenance and persistence
             db::dedupe_open_joins,
             db::set_group_watchlisted_for_users,

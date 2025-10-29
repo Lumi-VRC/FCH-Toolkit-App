@@ -1,6 +1,6 @@
-﻿[package]
+[package]
 name = "fchtoolkit"
-version = "1.2.1"
+version = "1.3.1"
 description = "Watchlister"
 authors = ["Lumine Arashi"]
 edition = "2021"
@@ -33,6 +33,7 @@ rodio = { version = "0.17", default-features = true, features = ["mp3"] }
 rfd = "0.14"
 rusqlite = { version = "0.30", features = ["bundled", "chrono"] }
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+
 
 
 

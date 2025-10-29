@@ -205,6 +205,9 @@ async fn log_watch_loop(app: tauri::AppHandle) -> Result<()> {
     let re_joining =
         Regex::new(r"Joining\s+(wrld_[a-f0-9\-]{36}):([^~\s]+)(?:~region\(([^)]+)\))?").unwrap();
     let re_analysis_path = Regex::new(r"/analysis/(file_[a-z0-9\-]+)/([0-9]+)/security").unwrap();
+    let re_prints_path = Regex::new(r"prints/(prnt_[a-z0-9\-]+)").unwrap();
+    let re_inventory_path =
+        Regex::new(r"user/(usr_[a-z0-9\-]+)/inventory/(inv_[a-z0-9\-]+)").unwrap();
     let re_switch_avatar =
         Regex::new(r"\[Behaviour\]\s+Switching\s+(.+?)\s+to\s+avatar\s+(.+)").unwrap();
 
@@ -502,7 +505,6 @@ async fn log_watch_loop(app: tauri::AppHandle) -> Result<()> {
                         last_offset = 0;
                         let _ = f.seek(SeekFrom::Start(0));
                         pending_line.clear();
-                        last_api_call_id = None;
                     }
                 }
             }
@@ -643,11 +645,11 @@ async fn log_watch_loop(app: tauri::AppHandle) -> Result<()> {
                                         let remainder = remainder[1..].trim_start();
                                         if remainder.starts_with("Sending Get request to ") {
                                             let url = &remainder["Sending Get request to ".len()..];
-                                            if url.starts_with(
-                                                "https://api.vrchat.cloud/api/1/analysis",
-                                            ) || url.starts_with(
-                                                "https://api.vrchat.cloud/api/1/avatars",
-                                            ) {
+                                            if url.starts_with("https://api.vrchat.cloud/api/1/analysis")
+            || url.starts_with("https://api.vrchat.cloud/api/1/avatars")
+            || url.contains("/prints/")
+            || url.contains("/inventory/")
+        {
                                                 let call_id_parsed =
                                                     call_id_str.trim().parse::<u32>().ok();
                                                 let should_emit = match call_id_parsed {
@@ -674,28 +676,111 @@ async fn log_watch_loop(app: tauri::AppHandle) -> Result<()> {
                                                     };
                                                     emit_debug(&app, message);
                                                 }
-                                                if let Some(caps) = re_analysis_path.captures(url) {
-                                                    let file_id = caps
+                                                if let Some(version_caps) =
+                                                    re_analysis_path.captures(url)
+                                                {
+                                                    let file_id = version_caps
                                                         .get(1)
                                                         .map(|m| m.as_str().to_string())
                                                         .unwrap_or_default();
-                                                    let version = caps
+                                                    let version = version_caps
                                                         .get(2)
-                                                        .and_then(|m| {
-                                                            m.as_str().parse::<i32>().ok()
-                                                        })
+                                                        .and_then(|m| m.as_str().parse::<i32>().ok())
                                                         .unwrap_or_default();
                                                     emit_debug(
-                                            &app,
-                                            format!(
-                                                "[watcher] analysis request detected -> file_id={} version={} ts={}",
-                                                file_id,
-                                                version,
-                                                ts
-                                            ),
-                                        );
+                                                        &app,
+                                                        format!(
+                                                            "[watcher] analysis request detected -> file_id={} version={} ts={}",
+                                                            file_id,
+                                                            version,
+                                                            ts
+                                                        ),
+                                                    );
                                                     if !file_id.is_empty() && version > 0 {
                                                         api_client.submit(file_id.clone(), version);
+                                                        emit_debug(
+                                                            &app,
+                                                            format!(
+                                                                "[API] analysis :: file_id={} version={} url={} ts={}",
+                                                                file_id,
+                                                                version,
+                                                                url,
+                                                                ts
+                                                            ),
+                                                        );
+                                                    }
+                                                }
+                                                if let Some(print_caps) =
+                                                    re_prints_path.captures(url)
+                                                {
+                                                    if let Some(identifier) = print_caps
+                                                        .get(1)
+                                                        .map(|m| m.as_str().to_string())
+                                                    {
+                                                        emit_debug(
+                                                            &app,
+                                                            format!(
+                                                                "[API] prints :: id={} url={} ts={}",
+                                                                identifier,
+                                                                url,
+                                                                ts
+                                                            ),
+                                                        );
+                                                        emit_debug(
+                                                            &app,
+                                                            format!(
+                                                                "[watcher] prints request detected -> id={} ts={}",
+                                                                identifier,
+                                                                ts
+                                                            ),
+                                                        );
+                                                        emit_debug(
+                                                            &app,
+                                                            format!(
+                                                                "[media] send invChk print id={identifier}"
+                                                            ),
+                                                        );
+                                                        api_client.submit_print(identifier.clone());
+                                                    }
+                                                }
+                                                if let Some(inv_caps) =
+                                                    re_inventory_path.captures(url)
+                                                {
+                                                    let user_id = inv_caps
+                                                        .get(1)
+                                                        .map(|m| m.as_str().to_string())
+                                                        .unwrap_or_default();
+                                                    let inventory_id = inv_caps
+                                                        .get(2)
+                                                        .map(|m| m.as_str().to_string())
+                                                        .unwrap_or_default();
+                                                    if !user_id.is_empty() && !inventory_id.is_empty() {
+                                                        let combined = format!("{}&{}", user_id, inventory_id);
+                                                        emit_debug(
+                                                            &app,
+                                                            format!(
+                                                                "[API] inventory :: id={} url={} ts={}",
+                                                                combined,
+                                                                url,
+                                                                ts
+                                                            ),
+                                                        );
+                                                        emit_debug(
+                                                            &app,
+                                                            format!(
+                                                                "[watcher] inventory request detected -> ids={} ts={}",
+                                                                combined,
+                                                                ts
+                                                            ),
+                                                        );
+                                                        emit_debug(
+                                                            &app,
+                                                            format!(
+                                                                "[media] send invChk inventory id={}",
+                                                                combined
+                                                            ),
+                                                        );
+                                                        api_client.submit_inventory(combined.clone());
                                                     }
                                                 }
                                                 continue;
@@ -906,7 +991,7 @@ mod api_checks {
     use serde::{Deserialize, Serialize};
     use serde_json::json;
     use std::collections::VecDeque;
-    use std::sync::{OnceLock, RwLock};
+    use std::sync::OnceLock;
     use std::time::Duration;
     use tauri::Emitter;
 
@@ -916,9 +1001,9 @@ mod api_checks {
     }
 
     #[derive(Debug, Clone)]
-    struct Job {
-        file_id: String,
-        version: i32,
+    enum Job {
+        SecurityCheck { file_id: String, version: i32 },
+        InvCheck { identifier: String },
     }
 
     #[derive(Serialize, Deserialize, Debug)]
@@ -943,7 +1028,15 @@ mod api_checks {
         }
 
         pub fn submit(&self, file_id: String, version: i32) {
-            let _ = self.sender.send(Job { file_id, version });
+            let _ = self.sender.send(Job::SecurityCheck { file_id, version });
+        }
+
+        pub fn submit_inventory(&self, identifier: String) {
+            let _ = self.sender.send(Job::InvCheck { identifier });
+        }
+
+        pub fn submit_print(&self, identifier: String) {
+            let _ = self.sender.send(Job::InvCheck { identifier });
         }
     }
 
@@ -955,6 +1048,9 @@ mod api_checks {
             std::env::var("API_CHECKS_HTTP_PATH").unwrap_or_else(|_| "/api/security-check".into());
         let url = std::env::var("API_CHECKS_HTTP_URL")
             .unwrap_or_else(|_| format!("{scheme}://{host}{path}"));
+        let inv_path = std::env::var("API_INV_CHECK_PATH").unwrap_or_else(|_| "/invChk".into());
+        let inv_url = std::env::var("API_INV_CHECK_URL")
+            .unwrap_or_else(|_| format!("{scheme}://{host}{inv_path}"));
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(90))
             .build()
@@ -964,26 +1060,38 @@ mod api_checks {
 
         loop {
             while let Ok(job) = rx.try_recv() {
-                emit_debug(
-                    &app,
-                    format!(
-                        "[apiChecks] job enqueued -> file_id={} version={}",
-                        job.file_id, job.version
+                match &job {
+                    Job::SecurityCheck { file_id, version } => emit_debug(
+                        &app,
+                        format!(
+                            "[apiChecks] job enqueued -> file_id={} version={}",
+                            file_id, version
+                        ),
                     ),
-                );
+                    Job::InvCheck { identifier } => emit_debug(
+                        &app,
+                        format!("[apiChecks] invChk job enqueued -> id={identifier}"),
+                    ),
+                }
                 backlog.push_back(job);
                 let _ = app.emit("api_queue_length", backlog.len() as i64);
             }
 
             let job = match backlog.pop_front() {
                 Some(job) => {
-                    emit_debug(
-                        &app,
-                        format!(
-                            "[apiChecks] processing job -> file_id={} version={}",
-                            job.file_id, job.version
+                    match &job {
+                        Job::SecurityCheck { file_id, version } => emit_debug(
+                            &app,
+                            format!(
+                                "[apiChecks] processing job -> file_id={} version={}",
+                                file_id, version
+                            ),
                         ),
-                    );
+                        Job::InvCheck { identifier } => emit_debug(
+                            &app,
+                            format!("[apiChecks] processing invChk -> id={identifier}"),
+                        ),
+                    }
                     job
                 }
                 None => {
@@ -994,130 +1102,307 @@ mod api_checks {
                 }
             };
 
-            let payload = json!({
-                "jobs": [json!({ "fileId": job.file_id, "version": job.version })]
-            });
+            match job {
+                Job::SecurityCheck { file_id, version } => {
+                    let payload = json!({
+                        "jobs": [json!({ "fileId": file_id, "version": version })]
+                    });
 
-            match http
-                .post(&url)
-                .timeout(Duration::from_secs(17))
-                .json(&payload)
-                .send()
-                .await
-            {
-                Ok(resp) => match resp.json::<ApiResponse>().await {
-                    Ok(parsed) => {
-                        if !parsed.success {
-                            emit_debug(
-                                &app,
-                                format!(
-                                    "[VRCAPI] security-check error: {}",
-                                    parsed.error.unwrap_or_else(|| "Unknown".into())
-                                ),
-                            );
-                            backlog.push_back(job);
-                            let _ = app.emit("api_queue_length", backlog.len() as i64);
-                        } else if let Some(results) = parsed.results {
-                            for value in results {
-                                if let Some(file_id) = value.get("file_id").and_then(|v| v.as_str()) {
-                                    let version = value
-                                        .get("version")
-                                        .and_then(|v| v.as_i64())
-                                        .unwrap_or_default();
-                                    let success = value
-                                        .get("success")
-                                        .and_then(|v| v.as_bool())
-                                        .unwrap_or(true);
+                    match http
+                        .post(&url)
+                        .timeout(Duration::from_secs(17))
+                        .json(&payload)
+                        .send()
+                        .await
+                    {
+                        Ok(resp) => match resp.json::<ApiResponse>().await {
+                            Ok(parsed) => {
+                                if !parsed.success {
                                     emit_debug(
                                         &app,
                                         format!(
-                                            "[VRCAPI] security-check complete {file_id} v{version} success={success}"
+                                            "[VRCAPI] security-check error: {}",
+                                            parsed.error.unwrap_or_else(|| "Unknown".into())
                                         ),
                                     );
-
-                                    let version_i32 = version as i32;
-                                    let file_json = value.get("file").cloned();
-                                    let security_json = value.get("security").cloned();
-                                    let owner_id = value
-                                        .get("owner_id")
-                                        .and_then(|v| v.as_str())
-                                        .or_else(|| {
-                                            value
-                                                .get("file")
-                                                .and_then(|f| f.get("ownerId"))
-                                                .and_then(|v| v.as_str())
-                                        })
-                                        .unwrap_or("");
-                                    let avatar_name = value
-                                        .get("avatar_name")
-                                        .and_then(|v| v.as_str())
-                                        .or_else(|| {
-                                            value
-                                                .get("avatarName")
-                                                .and_then(|v| v.as_str())
-                                        })
-                                        .or_else(|| {
-                                            value
-                                                .get("file")
-                                                .and_then(|f| f.get("name"))
-                                                .and_then(|v| v.as_str())
-                                        })
-                                        .unwrap_or("");
-
-                                    if !avatar_name.trim().is_empty() {
-                                        match crate::db::db_insert_avatar_details(
-                                            &app,
-                                            avatar_name,
-                                            owner_id,
-                                            Some(file_id),
-                                            Some(version_i32),
-                                            file_json.as_ref(),
-                                            security_json.as_ref(),
-                                        ) {
-                                            Ok(_) => emit_debug(
+                                    backlog.push_back(Job::SecurityCheck { file_id, version });
+                                    let _ = app.emit("api_queue_length", backlog.len() as i64);
+                                } else if let Some(results) = parsed.results {
+                                    for value in results {
+                                        if let Some(fid) = value.get("file_id").and_then(|v| v.as_str()) {
+                                            let version_val = value
+                                                .get("version")
+                                                .and_then(|v| v.as_i64())
+                                                .unwrap_or_default();
+                                            let success = value
+                                                .get("success")
+                                                .and_then(|v| v.as_bool())
+                                                .unwrap_or(true);
+                                            emit_debug(
                                                 &app,
                                                 format!(
-                                                    "[VRCAPI] avatar details stored :: avatar={} owner={} version={}",
-                                                    avatar_name, owner_id, version_i32
+                                                    "[VRCAPI] security-check complete {fid} v{version_val} success={success}"
                                                 ),
-                                            ),
-                                            Err(err) => emit_debug(
-                                                &app,
-                                                format!(
-                                                    "[VRCAPI] avatar details store failed :: avatar={} err={:?}",
-                                                    avatar_name, err
-                                                ),
-                                            ),
+                                            );
+
+                                            let version_i32 = version_val as i32;
+                                            let file_json = value.get("file").cloned();
+                                            let security_json = value.get("security").cloned();
+                                            let owner_id = value
+                                                .get("owner_id")
+                                                .and_then(|v| v.as_str())
+                                                .or_else(|| {
+                                                    value
+                                                        .get("file")
+                                                        .and_then(|f| f.get("ownerId"))
+                                                        .and_then(|v| v.as_str())
+                                                })
+                                                .unwrap_or("");
+                                            let avatar_name = value
+                                                .get("avatar_name")
+                                                .and_then(|v| v.as_str())
+                                                .or_else(|| {
+                                                    value
+                                                        .get("avatarName")
+                                                        .and_then(|v| v.as_str())
+                                                })
+                                                .or_else(|| {
+                                                    value
+                                                        .get("file")
+                                                        .and_then(|f| f.get("name"))
+                                                        .and_then(|v| v.as_str())
+                                                })
+                                                .unwrap_or("");
+
+                                            if !avatar_name.trim().is_empty() {
+                                                match crate::db::db_insert_avatar_details(
+                                                    &app,
+                                                    avatar_name,
+                                                    owner_id,
+                                                    Some(fid),
+                                                    Some(version_i32),
+                                                    file_json.as_ref(),
+                                                    security_json.as_ref(),
+                                                ) {
+                                                    Ok(_) => emit_debug(
+                                                        &app,
+                                                        format!(
+                                                            "[VRCAPI] avatar details stored :: avatar={} owner={} version={}",
+                                                            avatar_name, owner_id, version_i32
+                                                        ),
+                                                    ),
+                                                    Err(err) => emit_debug(
+                                                        &app,
+                                                        format!(
+                                                            "[VRCAPI] avatar details store failed :: avatar={} err={:?}",
+                                                            avatar_name, err
+                                                        ),
+                                                    ),
+                                                }
+                                            }
+
+                                            let _ = app.emit("api_checks_result", value.clone());
                                         }
                                     }
+                                    let _ = app.emit("api_queue_length", backlog.len() as i64);
+                                }
+                            }
+                            Err(err) => {
+                                emit_debug(
+                                    &app,
+                                    format!("[VRCAPI] security-check parse failed: {err}")
+                                );
+                                backlog.push_back(Job::SecurityCheck { file_id, version });
+                                let _ = app.emit("api_queue_length", backlog.len() as i64);
+                                tokio::time::sleep(Duration::from_secs(3)).await;
+                            }
+                        },
+                        Err(err) => {
+                            emit_debug(
+                                &app,
+                                format!("[VRCAPI] security-check request failed: {err}")
+                            );
+                            backlog.push_back(Job::SecurityCheck { file_id, version });
+                            let _ = app.emit("api_queue_length", backlog.len() as i64);
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                        }
+                    }
+                }
+                Job::InvCheck { identifier } => {
+                    match http
+                        .post(&inv_url)
+                        .timeout(Duration::from_secs(17))
+                        .json(&json!({ "id": identifier }))
+                        .send()
+                        .await
+                    {
+                        Ok(resp) => {
+                            if !resp.status().is_success() {
+                                emit_debug(
+                                    &app,
+                                    format!(
+                                        "[apiChecks] invChk error: HTTP {}",
+                                        resp.status()
+                                    )
+                                );
+                            } else {
+                                emit_debug(
+                                    &app,
+                                    format!(
+                                        "[apiChecks] invChk dispatched successfully id={identifier}"
+                                    ),
+                                );
+                                if let Ok(json_value) = resp.json::<serde_json::Value>().await {
+                                    emit_debug(
+                                        &app,
+                                        format!("[media] invChk result raw: {}", json_value),
+                                    );
+                                    let payload = json_value.get("payload");
+                                    if let Some(obj) = payload.and_then(|v| v.as_object()) {
+                                        let resolved_type = obj
+                                            .get("itemType")
+                                            .or_else(|| obj.get("item_type"))
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_lowercase())
+                                            .unwrap_or_default();
+                                        let owner = obj
+                                            .get("ownerId")
+                                            .or_else(|| obj.get("owner_id"))
+                                            .or_else(|| obj.get("holderId"))
+                                            .or_else(|| obj.get("holder_id"))
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string());
+                                        let image = obj
+                                            .get("imageUrl")
+                                            .or_else(|| obj.get("image_url"))
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string());
+                                        let canonical_type = match resolved_type.as_str() {
+                                            "print" | "sticker" | "emoji" => resolved_type.clone(),
+                                            other => {
+                                                let fields = [
+                                                    obj.get("id").and_then(|v| v.as_str()),
+                                                    obj.get("itemId").and_then(|v| v.as_str()),
+                                                    obj.get("item_id").and_then(|v| v.as_str()),
+                                                    obj.get("inventoryId").and_then(|v| v.as_str()),
+                                                    obj.get("inventory_id").and_then(|v| v.as_str()),
+                                                ];
 
-                                    let _ = app.emit("api_checks_result", value.clone());
+                                                let mut inferred: Option<String> = None;
+                                                if identifier.starts_with("prnt_")
+                                                    || fields.iter().flatten().any(|v| v.starts_with("prnt_"))
+                                                {
+                                                    inferred = Some("print".to_string());
+                                                } else if fields
+                                                    .iter()
+                                                    .flatten()
+                                                    .any(|v| v.starts_with("sticker_"))
+                                                {
+                                                    inferred = Some("sticker".to_string());
+                                                } else if fields
+                                                    .iter()
+                                                    .flatten()
+                                                    .any(|v| v.starts_with("emoji_"))
+                                                {
+                                                    inferred = Some("emoji".to_string());
+                                                } else if let Some(meta) = obj
+                                                    .get("metadata")
+                                                    .and_then(|v| v.as_object())
+                                                {
+                                                    if let Some(template_id) = meta
+                                                        .get("templateId")
+                                                        .or_else(|| meta.get("template_id"))
+                                                        .and_then(|v| v.as_str())
+                                                    {
+                                                        let lower = template_id.to_lowercase();
+                                                        if lower.contains("sticker") {
+                                                            inferred = Some("sticker".to_string());
+                                                        } else if lower.contains("emoji") {
+                                                            inferred = Some("emoji".to_string());
+                                                        }
+                                                    }
+                                                    if inferred.is_none() {
+                                                        if let Some(tags_val) = meta.get("tags") {
+                                                            if let Some(arr) = tags_val.as_array() {
+                                                                if arr.iter().any(|tag| {
+                                                                    tag.as_str()
+                                                                        .map(|t| t.eq_ignore_ascii_case("sticker"))
+                                                                        .unwrap_or(false)
+                                                                }) {
+                                                                    inferred = Some("sticker".to_string());
+                                                                } else if arr.iter().any(|tag| {
+                                                                    tag.as_str()
+                                                                        .map(|t| t.eq_ignore_ascii_case("emoji"))
+                                                                        .unwrap_or(false)
+                                                                }) {
+                                                                    inferred = Some("emoji".to_string());
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
+                                                inferred.unwrap_or_else(|| {
+                                                    if other.is_empty() {
+                                                        "inventory".to_string()
+                                                    } else {
+                                                        other.to_string()
+                                                    }
+                                                })
+                                            }
+                                        };
+                                        let normalized = if canonical_type == "print" {
+                                            identifier.clone()
+                                        } else {
+                                            if identifier.contains('&') {
+                                                identifier.clone()
+                                            } else if let (Some(owner_ref), Some(id_ref)) = (
+                                                owner.as_ref(),
+                                                obj.get("id").and_then(|v| v.as_str()),
+                                            ) {
+                                                format!("{}&{}", owner_ref, id_ref)
+                                            } else {
+                                                identifier.clone()
+                                            }
+                                        };
+                                        let _ = crate::db::db_upsert_media_item(
+                                            normalized.as_str(),
+                                            canonical_type.as_str(),
+                                            owner.as_deref(),
+                                            image.as_deref(),
+                                        );
+                                        let _ = app.emit(
+                                            "media_item_updated",
+                                            serde_json::json!({
+                                                "id": normalized,
+                                                "itemType": canonical_type,
+                                                "ownerId": owner,
+                                            }),
+                                        );
+                                        emit_debug(
+                                            &app,
+                                            format!(
+                                                "[media] emitted media_item_updated (inventory) id={}",
+                                                normalized
+                                            ),
+                                        );
+                                    }
                                 }
                             }
                             let _ = app.emit("api_queue_length", backlog.len() as i64);
                         }
+                        Err(err) => {
+                            emit_debug(
+                                &app,
+                                format!("[apiChecks] invChk request failed: {err}")
+                            );
+                            backlog.push_back(Job::InvCheck { identifier });
+                            let _ = app.emit("api_queue_length", backlog.len() as i64);
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                        }
                     }
-                    Err(err) => {
-                        emit_debug(
-                            &app,
-                            format!("[VRCAPI] security-check parse failed: {err}")
-                        );
-                        backlog.push_back(job.clone());
-                        let _ = app.emit("api_queue_length", backlog.len() as i64);
-                        tokio::time::sleep(Duration::from_secs(3)).await;
-                    }
-                },
-                Err(err) => {
-                    emit_debug(
-                        &app,
-                        format!("[VRCAPI] security-check request failed: {err}")
-                    );
-                    backlog.push_back(job.clone());
-                    let _ = app.emit("api_queue_length", backlog.len() as i64);
-                    tokio::time::sleep(Duration::from_secs(3)).await;
                 }
             }
-            let _ = app.emit("api_queue_length", backlog.len() as i64);
         }
     }
 }

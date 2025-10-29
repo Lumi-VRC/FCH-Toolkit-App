@@ -33,11 +33,11 @@
 //   value  TEXT NOT NULL
 use crate::debug::emit_debug;
 use anyhow::Result;
-use std::collections::HashSet;
-use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 use tauri::Emitter;
+use chrono::Local;
+use serde::Serialize;
 
 // Compute the absolute path of the SQLite file so all modules share the same DB.
 fn db_path() -> PathBuf {
@@ -52,9 +52,6 @@ fn open_connection() -> rusqlite::Result<rusqlite::Connection> {
 
 // Create tables and add missing columns. Safe to call repeatedly, here because I kept having to remake the db manually.
 pub fn db_init() -> rusqlite::Result<()> {
-    let p = db_path();
-    // Ensure the parent directory exists on first run (same folder as notes/config)
-    let _ = fs::create_dir_all(super::notes::notes_dir());
     let conn = open_connection()?;
     // Primary table: join rows and system rows live together, distinguished by
     // is_system (0 for players, 1 for system). We store join and optional leave
@@ -115,6 +112,13 @@ pub fn db_init() -> rusqlite::Result<()> {
             security_json TEXT,
             updated_at TEXT NOT NULL,
             PRIMARY KEY (avatar_name, owner_id)
+        );
+        CREATE TABLE IF NOT EXISTS media_items (
+            id TEXT PRIMARY KEY,
+            item_type TEXT NOT NULL,
+            owner_id TEXT,
+            image_url TEXT,
+            fetched_at TEXT NOT NULL
         );",
     )?;
     Ok(())
@@ -767,6 +771,30 @@ pub fn db_insert_avatar_details(
     Ok(())
 }
 
+pub fn db_upsert_media_item(
+    id: &str,
+    item_type: &str,
+    owner_id: Option<&str>,
+    image_url: Option<&str>,
+) -> Result<()> {
+    db_init()?;
+    let conn = open_connection()?;
+    let fetched_at = Local::now().format("%Y.%m.%d %H:%M:%S").to_string();
+    conn.execute(
+        "INSERT INTO media_items (id, item_type, owner_id, image_url, fetched_at) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(id) DO UPDATE SET item_type = excluded.item_type, owner_id = excluded.owner_id, image_url = excluded.image_url, fetched_at = excluded.fetched_at",
+        rusqlite::params![id, item_type, owner_id, image_url, fetched_at],
+    )?;
+    Ok(())
+}
+
+pub fn db_clear_media_items() -> Result<()> {
+    db_init()?;
+    let conn = open_connection()?;
+    conn.execute("DELETE FROM media_items", [])?;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn db_get_avatar_details(avatar_name: String) -> Result<Vec<serde_json::Value>, String> {
     let normalized = normalize_avatar_name(&avatar_name);
@@ -1160,4 +1188,48 @@ pub fn insert_avatar_details(
         security_ref,
     )
     .map_err(|e| e.to_string())
+}
+
+pub fn db_get_media_items(limit: usize) -> Result<Vec<MediaItem>> {
+    db_init()?;
+    let conn = open_connection()?;
+    let mut stmt = conn.prepare(
+        "SELECT id, item_type, owner_id, image_url, fetched_at FROM media_items ORDER BY datetime(fetched_at) DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
+        Ok(MediaItem {
+            id: row.get(0)?,
+            item_type: row.get(1)?,
+            owner_id: row.get::<_, Option<String>>(2)?,
+            image_url: row.get::<_, Option<String>>(3)?,
+            fetched_at: row.get(4)?,
+        })
+    })?;
+    let mut items = Vec::new();
+    for row in rows {
+        if let Ok(item) = row {
+            items.push(item);
+        }
+    }
+    Ok(items)
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct MediaItem {
+    pub id: String,
+    pub item_type: String,
+    pub owner_id: Option<String>,
+    pub image_url: Option<String>,
+    pub fetched_at: String,
+}
+
+#[tauri::command]
+pub fn get_media_items(limit: Option<usize>) -> Result<Vec<MediaItem>, String> {
+    let lim = limit.unwrap_or(200);
+    db_get_media_items(lim).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn clear_media_items() -> Result<(), String> {
+    db_clear_media_items().map_err(|e| e.to_string())
 }
