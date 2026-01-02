@@ -50,6 +50,14 @@ const tabDisplayMap: Record<Exclude<MediaTab, 'avatar'>, string> = {
   stickers: 'Sticker',
   prints: 'Print'
 };
+const LOOKUP_INTERVAL_MS = 10_000;
+const LOOKUP_BATCH_SIZE = 12;
+const MAX_LOOKUP_FAILURES = 10;
+const pendingLookups = new Set<string>();
+const lookupFailures = new Map<string, number>();
+const lookupBlacklist = new Set<string>();
+let lookupTimer: number | undefined;
+let lookupInFlight = false;
 
   async function loadMediaItems() {
     try {
@@ -63,12 +71,13 @@ const tabDisplayMap: Record<Exclude<MediaTab, 'avatar'>, string> = {
             entry.metadata?.imageUrl ??
             entry.metadata?.image_url ??
             null;
-          const owner =
+          const ownerRaw =
             entry.ownerId ??
             entry.owner_id ??
             entry.holderId ??
             entry.holder_id ??
             null;
+          const owner = typeof ownerRaw === 'string' ? ownerRaw.trim() : ownerRaw;
 
           return {
             id: entry.id,
@@ -80,15 +89,22 @@ const tabDisplayMap: Record<Exclude<MediaTab, 'avatar'>, string> = {
           } as MediaItem;
         })
         .filter((item) => allowedMediaTypes.has(item.itemType));
+      mediaItems.forEach((item) => {
+        if (item.ownerId && item.ownerName && item.ownerName !== item.ownerId && !liveLookup.has(item.ownerId)) {
+          liveLookup.set(item.ownerId, item.ownerName);
+        }
+      });
       console.log(`[media] gallery refreshed -> items loaded: ${mediaItems.length}`);
       if (mediaItems.length === 0) {
         console.warn('[media] no media items loaded (empty response)');
       }
       updateActiveTabItems();
+      void refreshMissingOwnerNames();
     } catch (err) {
       console.error('Failed to load media items', err);
       mediaItems = fallbackMediaItems.slice();
       updateActiveTabItems();
+      void refreshMissingOwnerNames();
     }
   }
 
@@ -150,13 +166,22 @@ const tabDisplayMap: Record<Exclude<MediaTab, 'avatar'>, string> = {
           await loadMediaItems();
           console.log('[media] gallery count after refresh:', mediaItems.length);
           updateActiveTabItems();
+          void refreshMissingOwnerNames();
         });
       } catch (err) {
         console.error('Failed to bind media_item_updated listener', err);
       }
     })();
+    lookupTimer = window.setInterval(() => {
+      void refreshMissingOwnerNames();
+    }, LOOKUP_INTERVAL_MS);
+    void refreshMissingOwnerNames();
     onDestroy(() => {
       unlistenMedia?.();
+      if (lookupTimer) {
+        window.clearInterval(lookupTimer);
+        lookupTimer = undefined;
+      }
     });
   });
 
@@ -211,6 +236,95 @@ function updateActiveTabItems(tabId: MediaTab = tab) {
     return liveLookup.get(ownerId) || historyLookup.get(ownerId) || null;
   }
 
+function shouldAttemptLookup(item: MediaItem): item is MediaItem & { ownerId: string } {
+  const ownerId = item.ownerId?.trim();
+  if (!ownerId) return false;
+  if (!ownerId.startsWith('usr_')) return false;
+  if (lookupBlacklist.has(ownerId)) return false;
+  if (pendingLookups.has(ownerId)) return false;
+  const resolved = liveLookup.get(ownerId);
+  if (resolved && resolved.length > 0) return false;
+  if (item.ownerName && item.ownerName !== ownerId) return false;
+  return true;
+}
+
+function recordLookupFailure(ownerId: string) {
+  const key = ownerId.trim();
+  const failures = (lookupFailures.get(key) ?? 0) + 1;
+  lookupFailures.set(key, failures);
+  if (failures >= MAX_LOOKUP_FAILURES) {
+    lookupBlacklist.add(key);
+    console.warn(`[media] owner lookup blacklisted after ${failures} failures :: ${key}`);
+  }
+}
+
+function applyOwnerName(ownerId: string, ownerName: string) {
+  const key = ownerId.trim();
+  liveLookup.set(key, ownerName);
+  mediaItems = mediaItems.map((item) =>
+    item.ownerId === key ? { ...item, ownerName } : item
+  );
+  if (selectedItem && selectedItem.ownerId === key) {
+    selectedItem = { ...selectedItem, ownerName };
+  }
+}
+
+async function attemptOwnerLookup(ownerId: string): Promise<{ ownerId: string; username: string } | null> {
+  const key = ownerId.trim();
+  if (!key || lookupBlacklist.has(key) || pendingLookups.has(key)) {
+    return null;
+  }
+  pendingLookups.add(key);
+  try {
+    const result: any = await invoke('get_latest_username_for_user', { userId: key });
+    const usernameRaw = typeof result?.username === 'string' ? result.username.trim() : '';
+    if (usernameRaw.length > 0) {
+      lookupFailures.delete(key);
+      return { ownerId: key, username: usernameRaw };
+    }
+    recordLookupFailure(key);
+    return null;
+  } catch (err) {
+    console.warn('[media] owner lookup failed', key, err);
+    recordLookupFailure(key);
+    return null;
+  } finally {
+    pendingLookups.delete(key);
+  }
+}
+
+async function refreshMissingOwnerNames() {
+  if (lookupInFlight) return;
+  const candidates = Array.from(
+    new Set(
+      mediaItems
+        .filter(shouldAttemptLookup)
+        .map((item) => item.ownerId?.trim())
+        .filter((ownerId): ownerId is string => typeof ownerId === 'string' && ownerId.length > 0)
+    )
+  ).filter((ownerId) => !lookupBlacklist.has(ownerId));
+  if (candidates.length === 0) {
+    return;
+  }
+  lookupInFlight = true;
+  try {
+    const batch = candidates.slice(0, LOOKUP_BATCH_SIZE);
+    const results = await Promise.all(batch.map((ownerId) => attemptOwnerLookup(ownerId)));
+    let updated = false;
+    for (const entry of results) {
+      if (entry) {
+        applyOwnerName(entry.ownerId, entry.username);
+        updated = true;
+      }
+    }
+    if (updated) {
+      updateActiveTabItems();
+    }
+  } finally {
+    lookupInFlight = false;
+  }
+}
+
   function closeItem() {
     selectedItem = null;
     reporting = false;
@@ -248,6 +362,13 @@ function updateActiveTabItems(tabId: MediaTab = tab) {
 
 onDestroy(() => {
   clearMediaCache();
+  lookupFailures.clear();
+  lookupBlacklist.clear();
+  pendingLookups.clear();
+  if (lookupTimer) {
+    window.clearInterval(lookupTimer);
+    lookupTimer = undefined;
+  }
 });
 
   type AvatarEntry = {

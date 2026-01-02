@@ -29,10 +29,11 @@ macro_rules! debug_log {
 pub async fn start_log_watcher(app_handle: tauri::AppHandle) -> Result<(), String> {
     debug_log!("[watcher] start requested");
     // Run the tail loop on a background task so the Tauri thread remains free.
+    let task_app = app_handle.clone();
     tokio::spawn(async move {
         debug_log!("[watcher] task spawned");
-        if let Err(e) = log_watch_loop(app_handle).await {
-            eprintln!("log watcher stopped: {e:?}");
+        if let Err(e) = log_watch_loop(task_app.clone()).await {
+            emit_debug(&task_app, format!("[watcher] fatal error: {e:?}"));
         }
     });
     Ok(())
@@ -217,10 +218,14 @@ async fn log_watch_loop(app: tauri::AppHandle) -> Result<()> {
     let mut current_path: Option<PathBuf> = None;
     let mut file: Option<fs::File> = None;
     let mut last_offset: u64 = 0; // where we've read up to in the file
-    let mut last_check = Instant::now(); // for rotation/truncation checks
+    let mut last_rotation_check = Instant::now(); // for rotation/truncation checks
     let mut pending_line = String::new(); // buffer for partial last line of a chunk
     let mut _did_backfill = false; // for debug visibility only
     let mut last_api_call_id: Option<u32> = None;
+    let mut last_heartbeat = Instant::now();
+
+    const ROTATION_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+    const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
     loop {
         debug_log!(
@@ -234,7 +239,7 @@ async fn log_watch_loop(app: tauri::AppHandle) -> Result<()> {
             _did_backfill
         );
         // Rotation/truncation check and initial open
-        if last_check.elapsed() >= Duration::from_millis(1000) || current_path.is_none() {
+        if last_rotation_check.elapsed() >= ROTATION_CHECK_INTERVAL || current_path.is_none() {
             debug_log!("[watcher] checking for latest file or truncation");
             let latest = find_latest_log_file(&vrchat_dir);
             if latest.as_ref() != current_path.as_ref() {
@@ -467,23 +472,32 @@ async fn log_watch_loop(app: tauri::AppHandle) -> Result<()> {
                                 }
                                 // After the scan, signal the frontend that it can load the initial state
                                 let _ = app.emit("watcher_ready", ());
-                                // Seek to the end of the file to process new lines
-                                let _ = f.seek(SeekFrom::Start(len));
-                                last_offset = len;
-                                pending_line.clear();
-                                last_api_call_id = None;
-                                file = Some(f);
-                                current_path = Some(p);
-                                debug_log!(
-                                    "[watcher] opened latest log: {} (len={})",
-                                    current_path.as_ref().unwrap().display(),
-                                    last_offset
-                                );
                                 _did_backfill = true;
                             }
+                            // Seek to the end of the file to process new lines
+                            let _ = f.seek(SeekFrom::Start(len));
+                            last_offset = len;
+                            pending_line.clear();
+                            last_api_call_id = None;
+                            current_path = Some(p.clone());
+                            file = Some(f);
+                            emit_debug(
+                                &app,
+                                format!(
+                                    "[watcher] opened latest log: {} (len={})",
+                                    p.display(),
+                                    last_offset
+                                ),
+                            );
                         }
                         Err(e) => {
-                            eprintln!("[watcher] failed to open log file {}: {e}", p.display());
+                            emit_debug(
+                                &app,
+                                format!(
+                                    "[watcher] failed to open log file {}: {e}",
+                                    p.display()
+                                ),
+                            );
                             file = None;
                             current_path = None;
                             last_offset = 0;
@@ -508,7 +522,7 @@ async fn log_watch_loop(app: tauri::AppHandle) -> Result<()> {
                     }
                 }
             }
-            last_check = Instant::now();
+            last_rotation_check = Instant::now();
         }
         // Read newly appended bytes and process complete lines when available
         // I had a *lot* of help making this function. It's a conglomerate of multiple previous temporary tools, with a focus on low overhead.
@@ -524,7 +538,7 @@ async fn log_watch_loop(app: tauri::AppHandle) -> Result<()> {
                         let n = match f.read(&mut buf[..to_read]) {
                             Ok(n) => n,
                             Err(e) => {
-                                eprintln!("[watcher] read error: {e}");
+                                emit_debug(&app, format!("[watcher] read error: {e}"));
                                 break;
                             }
                         };
@@ -811,7 +825,10 @@ async fn log_watch_loop(app: tauri::AppHandle) -> Result<()> {
                                     );
                                     last_api_call_id = None;
                                     if let Err(e) = super::db::db_purge_all(&app, ts, true) {
-                                        eprintln!("[watcher] failed to purge all: {e:?}");
+                                        emit_debug(
+                                            &app,
+                                            format!("[watcher] failed to purge all: {e:?}"),
+                                        );
                                     }
                                     continue;
                                 }
@@ -819,7 +836,12 @@ async fn log_watch_loop(app: tauri::AppHandle) -> Result<()> {
                                 if let Some(caps) = re_joining.captures(line) {
                                     last_api_call_id = None;
                                     if let Err(e) = super::db::db_purge_all(&app, ts, true) {
-                                        eprintln!("[watcher] failed to purge all on instance change: {e:?}");
+                                        emit_debug(
+                                            &app,
+                                            format!(
+                                                "[watcher] failed to purge all on instance change: {e:?}"
+                                            ),
+                                        );
                                     }
                                     let world_id = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                                     let instance_id = caps.get(2).map(|m| m.as_str()).unwrap_or("");
@@ -863,7 +885,12 @@ async fn log_watch_loop(app: tauri::AppHandle) -> Result<()> {
                                         if let Err(e) =
                                             super::db::db_insert_join(&app, ts, uid, username, true)
                                         {
-                                            eprintln!("[watcher] failed to insert join: {e:?}");
+                                            emit_debug(
+                                                &app,
+                                                format!(
+                                                    "[watcher] failed to insert join: {e:?}"
+                                                ),
+                                            );
                                         } else {
                                             emit_debug(&app, format!(
                                                 "Watcher processed join line -> uid={uid}, username={username}, ts={ts}, emit=true"
@@ -917,7 +944,12 @@ async fn log_watch_loop(app: tauri::AppHandle) -> Result<()> {
                                         if let Err(e) =
                                             super::db::db_update_leave(&app, ts, uid, true)
                                         {
-                                            eprintln!("[watcher] failed to update leave: {e:?}");
+                                            emit_debug(
+                                                &app,
+                                                format!(
+                                                    "[watcher] failed to update leave: {e:?}"
+                                                ),
+                                            );
                                         } else {
                                             emit_debug(
                                                 &app,
@@ -937,7 +969,12 @@ async fn log_watch_loop(app: tauri::AppHandle) -> Result<()> {
                                         if let Err(e) = super::db::db_update_leave_by_username(
                                             &app, ts, username, true,
                                         ) {
-                                            eprintln!("[watcher] failed to update leave by username: {e:?}");
+                                            emit_debug(
+                                                &app,
+                                                format!(
+                                                    "[watcher] failed to update leave by username: {e:?}"
+                                                ),
+                                            );
                                         } else {
                                             emit_debug(&app, format!(
 																					"Watcher processed username-only leave -> username={username}, ts={ts}, emit=true"
@@ -951,6 +988,23 @@ async fn log_watch_loop(app: tauri::AppHandle) -> Result<()> {
                     }
                 }
             }
+        }
+        if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+            let file_name = current_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string());
+            emit_debug(
+                &app,
+                format!(
+                    "[watcher] heartbeat :: file={} offset={} pending={} backfilled={}",
+                    file_name,
+                    last_offset,
+                    pending_line.len(),
+                    _did_backfill
+                ),
+            );
+            last_heartbeat = Instant::now();
         }
         // Short sleep prevents busy-looping while tailing the file
         tokio::time::sleep(Duration::from_millis(750)).await;

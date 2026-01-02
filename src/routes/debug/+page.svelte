@@ -79,6 +79,7 @@ let modalRequestId = 0;
   const includeVrcapi = writable(true);
   const includeAvatar = writable(false);
   const includePerf = writable(false);
+  const includeWatcher = writable(true);
   const includeOther = writable(true);
 
   const filters = derived(
@@ -90,6 +91,7 @@ let modalRequestId = 0;
       includeVrcapi,
       includeAvatar,
       includePerf,
+      includeWatcher,
       includeOther,
       entries
     ],
@@ -101,6 +103,7 @@ let modalRequestId = 0;
       $includeVrcapi,
       $includeAvatar,
       $includePerf,
+      $includeWatcher,
       $includeOther,
       $entries
     ]) => {
@@ -115,13 +118,14 @@ let modalRequestId = 0;
         if (tag === 'vrcapi' && !$includeVrcapi) return false;
         if (tag === 'avatar' && !$includeAvatar) return false;
         if (tag === 'perf' && !$includePerf) return false;
+        if (tag === 'watcher' && !$includeWatcher) return false;
         if (tag === 'other' && !$includeOther) return false;
         return true;
       });
     }
   );
 
-  function classify(message: string): 'group' | 'sound' | 'join' | 'vrcapi' | 'avatar' | 'perf' | 'other' {
+  function classify(message: string): 'group' | 'sound' | 'join' | 'vrcapi' | 'avatar' | 'perf' | 'watcher' | 'other' {
     const msg = message.toLowerCase();
     if (msg.includes('[group-watch]')) return 'group';
     if (msg.includes('[sound]')) return 'sound';
@@ -129,6 +133,7 @@ let modalRequestId = 0;
     if (msg.includes('[avatardata]')) return 'avatar';
     if (msg.includes('[avatarperf]')) return 'perf';
     if (msg.includes('[vrcapi]')) return 'vrcapi';
+    if (msg.includes('[watcher]')) return 'watcher';
     return 'other';
   }
 
@@ -139,6 +144,7 @@ let modalRequestId = 0;
     includeJoin.set(true);
     includeVrcapi.set(true);
     includeAvatar.set(false);
+    includeWatcher.set(true);
     includeOther.set(true);
   }
 </script>
@@ -161,6 +167,7 @@ let modalRequestId = 0;
       <label><input type="checkbox" bind:checked={$includeVrcapi} /> VRCAPI</label>
       <label><input type="checkbox" bind:checked={$includeAvatar} /> AvatarData</label>
       <label><input type="checkbox" bind:checked={$includePerf} /> AvatarPerf</label>
+      <label><input type="checkbox" bind:checked={$includeWatcher} /> Watcher</label>
       <label><input type="checkbox" bind:checked={$includeOther} /> Other</label>
     </div>
     <div class="counters">

@@ -14,10 +14,12 @@ export type MediaCardItem = {
   const dispatch = createEventDispatcher<{ select: void }>();
 
   let src: string = item.image ?? '';
-  let displayLabel = item.label ?? item.id;
+let displayLabel = item.label ?? item.id;
   let loading = true;
   let error: string | null = null;
   let active = true;
+
+$: displayLabel = item.label ?? item.id;
 
   $: (async () => {
     if (!item || !item.image) {
