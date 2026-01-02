@@ -4,6 +4,7 @@ Contact: @lumi_vrc on Discord
 
 ## Installation:
 1. In VRChat: Make sure **"Debug" logging** in Settings is set to **"Full"**.
+(Note: Some features require "--enable-sdk-log-levels" be added to your steam launch settings.)
 <img width="1157" height="647" alt="image" src="https://github.com/user-attachments/assets/d71a03c5-4cac-48e3-aa74-b618e294f0d8" />
 2. Run the provided .exe to start the program! I suggest pinning it to your taskbar.
 
