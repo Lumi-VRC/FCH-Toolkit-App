@@ -1,39 +1,44 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "FCH Toolkit",
-  "version": "1.3.2",
-  "identifier": "com.fch.client",
+  "productName": "FCH App",
+  "version": "2.1.0",
+  "identifier": "com.fch.app",
   "build": {
-    "beforeDevCommand": "npm run dev",
-    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev -- --host --port 5173",
+    "devUrl": "http://localhost:5173",
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../build"
   },
   "app": {
     "windows": [
       {
-        "title": "FCH Toolkit",
-        "width": 800,
-        "height": 600
+        "label": "main",
+        "title": "FCH App",
+        "width": 1024,
+        "height": 768
       }
     ],
     "security": {
-      "csp": null
+      "csp": null,
+      "capabilities": ["main-capability"]
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
-    "createUpdaterArtifacts": false,
     "icon": [
       "icons/icon.png",
       "icons/icon.ico",
       "icons/icon.icns",
       "icons/32x32.png",
+      "icons/64x64.png",
       "icons/128x128.png",
       "icons/128x128@2x.png"
     ]
   },
-  "plugins": {}
+  "plugins": {
+    "shell": {
+      "open": true
+    }
+  }
 }
-

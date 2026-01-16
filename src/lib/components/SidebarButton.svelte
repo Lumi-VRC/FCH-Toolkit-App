@@ -1,13 +1,12 @@
 <script lang="ts">
-  export let selected: boolean = false;
-  export let title: string = "";
-  export let onClick: () => void = () => {};
-  export let showLabel: boolean = false;
-  export let label: string = "";
-export let icon: 'dot' | 'list' | 'search' | 'gear' | 'vault' | 'bug' | 'globe' = 'dot';
+  let { selected = false, title = "", onClick = () => {}, showLabel = false, label = "", icon = 'dot' } = $props();
+  
+  function handleClick(e) {
+    onClick();
+  }
 </script>
 
-<button class:selected class:center={!showLabel} onclick={onClick} class="btn" aria-pressed={selected} {title}>
+<button class:selected class:center={!showLabel} onclick={handleClick} class="btn" aria-pressed={selected} {title}>
   <span class="icon" aria-hidden="true">
     {#if icon === 'list'}
       <!-- list icon -->
@@ -96,4 +95,3 @@ export let icon: 'dot' | 'list' | 'search' | 'gear' | 'vault' | 'bug' | 'globe' 
   .icon { display: inline-flex; color: var(--fg-muted); align-items: center; justify-content: center; }
   .text { color: var(--fg); font-size: 12px; font-weight: 600; opacity: 0.95; }
 </style>
-

@@ -1,924 +1,337 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
+  import { listen } from '@tauri-apps/api/event';
 
-type MediaTab = 'media' | 'emojis' | 'stickers' | 'prints' | 'avatar';
-let tab: MediaTab = 'media';
-
-  const tabs: Array<{ id: MediaTab; label: string }> = [
-    { id: 'media', label: 'Media' },
-    { id: 'emojis', label: 'Emojis' },
-    { id: 'stickers', label: 'Stickers' },
-    { id: 'prints', label: 'Prints' },
-    { id: 'avatar', label: 'Avatar Logs' }
-  ];
-
-  type MediaItem = {
-    id: string;
-    itemType: string;
-    imageUrl: string | null;
-    ownerId: string | null;
-    ownerName?: string | null;
-    fetchedAt: string;
+  type BanLogEntry = {
+    id: number;
+    admin: string;
+    target: string;
+    reason: string;
+    timestamp: string;
+    action_type: string; // "ban" or "warn"
   };
 
-import MediaCard from '$lib/components/MediaCard.svelte';
-import { clearMediaCache, prefetchMedia } from '$lib/stores/mediaCache';
-import type { MediaCardItem as CardItem } from '$lib/components/MediaCard.svelte';
+  let banLogs = $state<BanLogEntry[]>([]);
+  let searchQuery = $state('');
+  let unlisten = null;
+  let containerElement;
 
-export let fallbackMediaItems: MediaItem[] = [];
-let mediaItems: MediaItem[] = fallbackMediaItems;
-let selectedItem: MediaItem | null = null;
-let activeMediaTabItems: MediaItem[] = [];
-let clearing = false;
-let reporting = false;
-
-  const MEDIA_FETCH_LIMIT = 150;
-  const MEDIA_TAB_LIMIT = 48;
-const allowedMediaTypes = new Set(['print', 'sticker', 'emoji']);
-const liveLookup = new Map<string, string>();
-const historyLookup = new Map<string, string>();
-type MediaTypeKey = 'print' | 'sticker' | 'emoji';
-const typeDisplayMap: Record<MediaTypeKey, string> = {
-  print: 'Print',
-  sticker: 'Sticker',
-  emoji: 'Emoji'
-};
-const tabDisplayMap: Record<Exclude<MediaTab, 'avatar'>, string> = {
-  media: 'Media',
-  emojis: 'Emoji',
-  stickers: 'Sticker',
-  prints: 'Print'
-};
-const LOOKUP_INTERVAL_MS = 10_000;
-const LOOKUP_BATCH_SIZE = 12;
-const MAX_LOOKUP_FAILURES = 10;
-const pendingLookups = new Set<string>();
-const lookupFailures = new Map<string, number>();
-const lookupBlacklist = new Set<string>();
-let lookupTimer: number | undefined;
-let lookupInFlight = false;
-
-  async function loadMediaItems() {
+  async function loadBanLogs() {
+    const startTime = performance.now();
+    const isSearch = searchQuery.trim();
+    console.log(`[PERF] world-moderation loadBanLogs() START (search: ${isSearch})`);
     try {
-      const raw: any[] = await invoke('get_media_items', { limit: MEDIA_FETCH_LIMIT });
-      mediaItems = raw
-        .map((entry) => {
-          const rawType = String(entry.itemType ?? entry.item_type ?? entry.type ?? '').toLowerCase();
-          const image =
-            entry.imageUrl ??
-            entry.image_url ??
-            entry.metadata?.imageUrl ??
-            entry.metadata?.image_url ??
-            null;
-          const ownerRaw =
-            entry.ownerId ??
-            entry.owner_id ??
-            entry.holderId ??
-            entry.holder_id ??
-            null;
-          const owner = typeof ownerRaw === 'string' ? ownerRaw.trim() : ownerRaw;
-
-          return {
-            id: entry.id,
-            itemType: rawType,
-            imageUrl: image,
-            ownerId: owner,
-            ownerName: entry.ownerName ?? entry.owner_name ?? (owner ? lookupOwnerName(owner) : null),
-            fetchedAt: entry.fetchedAt ?? entry.fetched_at ?? ''
-          } as MediaItem;
-        })
-        .filter((item) => allowedMediaTypes.has(item.itemType));
-      mediaItems.forEach((item) => {
-        if (item.ownerId && item.ownerName && item.ownerName !== item.ownerId && !liveLookup.has(item.ownerId)) {
-          liveLookup.set(item.ownerId, item.ownerName);
-        }
-      });
-      console.log(`[media] gallery refreshed -> items loaded: ${mediaItems.length}`);
-      if (mediaItems.length === 0) {
-        console.warn('[media] no media items loaded (empty response)');
+      if (isSearch) {
+        const dbStartTime = performance.now();
+        const results = await invoke<BanLogEntry[]>('search_ban_log_entries', { query: searchQuery });
+        const dbDuration = performance.now() - dbStartTime;
+        console.log(`[PERF] world-moderation search_ban_log_entries DB call: ${dbDuration.toFixed(2)}ms`);
+        banLogs = results || [];
+      } else {
+        const dbStartTime = performance.now();
+        const results = await invoke<BanLogEntry[]>('get_all_ban_log_entries');
+        const dbDuration = performance.now() - dbStartTime;
+        console.log(`[PERF] world-moderation get_all_ban_log_entries DB call: ${dbDuration.toFixed(2)}ms`);
+        banLogs = results || [];
       }
-      updateActiveTabItems();
-      void refreshMissingOwnerNames();
+      const totalDuration = performance.now() - startTime;
+      console.log(`[PERF] world-moderation loadBanLogs() END: ${totalDuration.toFixed(2)}ms (${banLogs.length} entries)`);
     } catch (err) {
-      console.error('Failed to load media items', err);
-      mediaItems = fallbackMediaItems.slice();
-      updateActiveTabItems();
-      void refreshMissingOwnerNames();
+      console.error('Failed to load ban logs:', err);
+      banLogs = [];
     }
   }
 
-  async function clearMediaItems() {
-    if (clearing) return;
-    clearing = true;
+  // Debounced search
+  let searchTimer = null;
+  function onSearchInput() {
+    if (searchTimer) {
+      clearTimeout(searchTimer);
+    }
+    searchTimer = setTimeout(() => {
+      loadBanLogs();
+    }, 300);
+  }
+
+  // Check if the tab is currently visible
+  function isTabVisible() {
+    if (!containerElement) return false;
+    const parent = containerElement.closest('.tab');
+    if (!parent) return false;
+    return parent.getAttribute('aria-hidden') === null;
+  }
+
+  let wasVisible = false;
+  let observer = null;
+
+  function checkVisibility() {
+    const isVisible = isTabVisible();
+    if (isVisible && !wasVisible) {
+      loadBanLogs();
+    }
+    wasVisible = isVisible;
+  }
+
+  onMount(async () => {
+    const mountStartTime = performance.now();
+    console.log('[PERF] world-moderation onMount START');
+    // Initial load
+    await loadBanLogs();
+
+    // Listen for new ban events
     try {
-      await invoke('clear_media_items');
-      await loadMediaItems();
-      console.log('[media] media cache cleared');
-    } catch (err) {
-      console.error('Failed to clear media items', err);
-    } finally {
-      clearing = false;
-    }
-  }
-
-  function getDisplayType(item: MediaItem, contextTab: MediaTab = tab): string {
-    const direct = typeDisplayMap[item.itemType as MediaTypeKey];
-    if (direct) return direct;
-    if (contextTab !== 'avatar') {
-      const fallback = tabDisplayMap[contextTab as Exclude<MediaTab, 'avatar'>];
-      if (fallback) return fallback;
-    }
-    const raw = item.itemType.trim();
-    return raw.length > 0 ? raw : 'Media';
-  }
-
-  async function populateHistoryLookup() {
-    try {
-      const history: any[] = await invoke('get_active_join_logs');
-      history.forEach((entry) => {
-        const userId = entry.userId || entry.user_id;
-        const username = entry.username || entry.ownerId || entry.owner_id;
-        if (userId && username) {
-          historyLookup.set(String(userId), String(username));
+      const listenerStartTime = performance.now();
+      unlisten = await listen('ban_event', async () => {
+        // Reload logs when a new ban event is detected
+        if (isTabVisible()) {
+          console.log('[PERF] world-moderation ban_event received, reloading logs');
+          await loadBanLogs();
         }
       });
+      const listenerDuration = performance.now() - listenerStartTime;
+      console.log(`[PERF] world-moderation event listener setup: ${listenerDuration.toFixed(2)}ms`);
     } catch (err) {
-      console.warn('Failed to populate history lookup', err);
+      console.error('Failed to set up ban event listener:', err);
     }
-  }
 
-  let initialized = false;
+    // Set up MutationObserver to watch for tab visibility changes
+    if (containerElement) {
+      const parent = containerElement.closest('.tab');
+      if (parent) {
+        wasVisible = isTabVisible();
 
-  onMount(() => {
-    if (!initialized) {
-      initialized = true;
-      void populateHistoryLookup();
-      void loadMediaItems();
-      void loadEntries(0);
-    }
-    let unlistenMedia: undefined | (() => void);
-    (async () => {
-      try {
-        const { listen } = await import('@tauri-apps/api/event');
-        unlistenMedia = await listen('media_item_updated', async () => {
-          console.log('[media] event received -> refreshing gallery');
-          await loadMediaItems();
-          console.log('[media] gallery count after refresh:', mediaItems.length);
-          updateActiveTabItems();
-          void refreshMissingOwnerNames();
+        observer = new MutationObserver(() => {
+          checkVisibility();
         });
-      } catch (err) {
-        console.error('Failed to bind media_item_updated listener', err);
+
+        observer.observe(parent, {
+          attributes: true,
+          attributeFilter: ['aria-hidden']
+        });
       }
-    })();
-    lookupTimer = window.setInterval(() => {
-      void refreshMissingOwnerNames();
-    }, LOOKUP_INTERVAL_MS);
-    void refreshMissingOwnerNames();
-    onDestroy(() => {
-      unlistenMedia?.();
-      if (lookupTimer) {
-        window.clearInterval(lookupTimer);
-        lookupTimer = undefined;
-      }
-    });
+    }
+    const mountDuration = performance.now() - mountStartTime;
+    console.log(`[PERF] world-moderation onMount END: ${mountDuration.toFixed(2)}ms`);
   });
 
-  function openItem(item: MediaItem) {
-    selectedItem = item;
-  }
-
-function selectTab(newTab: MediaTab) {
-  tab = newTab;
-  updateActiveTabItems(newTab);
-}
-
-  function getActiveItems(tabId: MediaTab) {
-    if (tabId === 'avatar') return [];
-    const filtered = mediaItems.filter((item) => {
-      if (tabId === 'media') return true;
-      if (tabId === 'prints') return item.itemType.toLowerCase() === 'print';
-      if (tabId === 'emojis') return item.itemType.toLowerCase() === 'emoji';
-      if (tabId === 'stickers') return item.itemType.toLowerCase() === 'sticker';
-      return false;
-    });
-    const deduped = Array.from(new Map(filtered.map((item) => [item.id, item])).values());
-    const sorted = deduped.sort((a, b) => (b.fetchedAt || '').localeCompare(a.fetchedAt || ''));
-    return sorted
-      .slice(0, MEDIA_TAB_LIMIT)
-      .map((item) => ({
-        ...item,
-        ownerName: lookupOwnerName(item.ownerId) ?? item.ownerId ?? 'Unknown'
-      }));
-  }
-
-function updateActiveTabItems(tabId: MediaTab = tab) {
-  if (tabId === 'avatar') {
-    activeMediaTabItems = [];
-    return;
-  }
-  const itemsForTab = getActiveItems(tabId);
-  activeMediaTabItems = itemsForTab;
-  const uniqueUrls = Array.from(
-    new Set(
-      itemsForTab
-        .map((item) => item.imageUrl)
-        .filter((url): url is string => typeof url === 'string' && url.length > 0)
-    )
-  ).slice(0, 24);
-  console.log(`[media] prefetch unique urls: ${uniqueUrls.length}`);
-  prefetchMedia(uniqueUrls);
-}
-
-  function lookupOwnerName(ownerId: string | null): string | null {
-    if (!ownerId) return null;
-    return liveLookup.get(ownerId) || historyLookup.get(ownerId) || null;
-  }
-
-function shouldAttemptLookup(item: MediaItem): item is MediaItem & { ownerId: string } {
-  const ownerId = item.ownerId?.trim();
-  if (!ownerId) return false;
-  if (!ownerId.startsWith('usr_')) return false;
-  if (lookupBlacklist.has(ownerId)) return false;
-  if (pendingLookups.has(ownerId)) return false;
-  const resolved = liveLookup.get(ownerId);
-  if (resolved && resolved.length > 0) return false;
-  if (item.ownerName && item.ownerName !== ownerId) return false;
-  return true;
-}
-
-function recordLookupFailure(ownerId: string) {
-  const key = ownerId.trim();
-  const failures = (lookupFailures.get(key) ?? 0) + 1;
-  lookupFailures.set(key, failures);
-  if (failures >= MAX_LOOKUP_FAILURES) {
-    lookupBlacklist.add(key);
-    console.warn(`[media] owner lookup blacklisted after ${failures} failures :: ${key}`);
-  }
-}
-
-function applyOwnerName(ownerId: string, ownerName: string) {
-  const key = ownerId.trim();
-  liveLookup.set(key, ownerName);
-  mediaItems = mediaItems.map((item) =>
-    item.ownerId === key ? { ...item, ownerName } : item
-  );
-  if (selectedItem && selectedItem.ownerId === key) {
-    selectedItem = { ...selectedItem, ownerName };
-  }
-}
-
-async function attemptOwnerLookup(ownerId: string): Promise<{ ownerId: string; username: string } | null> {
-  const key = ownerId.trim();
-  if (!key || lookupBlacklist.has(key) || pendingLookups.has(key)) {
-    return null;
-  }
-  pendingLookups.add(key);
-  try {
-    const result: any = await invoke('get_latest_username_for_user', { userId: key });
-    const usernameRaw = typeof result?.username === 'string' ? result.username.trim() : '';
-    if (usernameRaw.length > 0) {
-      lookupFailures.delete(key);
-      return { ownerId: key, username: usernameRaw };
+  onDestroy(() => {
+    if (unlisten) {
+      unlisten();
     }
-    recordLookupFailure(key);
-    return null;
-  } catch (err) {
-    console.warn('[media] owner lookup failed', key, err);
-    recordLookupFailure(key);
-    return null;
-  } finally {
-    pendingLookups.delete(key);
-  }
-}
-
-async function refreshMissingOwnerNames() {
-  if (lookupInFlight) return;
-  const candidates = Array.from(
-    new Set(
-      mediaItems
-        .filter(shouldAttemptLookup)
-        .map((item) => item.ownerId?.trim())
-        .filter((ownerId): ownerId is string => typeof ownerId === 'string' && ownerId.length > 0)
-    )
-  ).filter((ownerId) => !lookupBlacklist.has(ownerId));
-  if (candidates.length === 0) {
-    return;
-  }
-  lookupInFlight = true;
-  try {
-    const batch = candidates.slice(0, LOOKUP_BATCH_SIZE);
-    const results = await Promise.all(batch.map((ownerId) => attemptOwnerLookup(ownerId)));
-    let updated = false;
-    for (const entry of results) {
-      if (entry) {
-        applyOwnerName(entry.ownerId, entry.username);
-        updated = true;
-      }
+    if (observer) {
+      observer.disconnect();
     }
-    if (updated) {
-      updateActiveTabItems();
-    }
-  } finally {
-    lookupInFlight = false;
-  }
-}
-
-  function closeItem() {
-    selectedItem = null;
-    reporting = false;
-  }
-
-  async function reportSelectedItem() {
-    if (!selectedItem) return;
-    const payload = {
-      id: selectedItem.id,
-      imageUrl: selectedItem.imageUrl ?? null,
-      type: selectedItem.itemType ?? 'unknown'
-    };
-    if (!payload.imageUrl) {
-      console.warn('[media] Cannot report item without image URL');
-      return;
-    }
-    reporting = true;
-    try {
-      const response = await fetch('https://fch-toolkit.com/img-report', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      if (!response.ok) {
-        const text = await response.text();
-        throw new Error(text || `HTTP ${response.status}`);
-      }
-      console.log('[media] instant report submitted', payload);
-    } catch (err) {
-      console.error('[media] instant report failed', err);
-    } finally {
-      reporting = false;
-    }
-  }
-
-onDestroy(() => {
-  clearMediaCache();
-  lookupFailures.clear();
-  lookupBlacklist.clear();
-  pendingLookups.clear();
-  if (lookupTimer) {
-    window.clearInterval(lookupTimer);
-    lookupTimer = undefined;
-  }
-});
-
-  type AvatarEntry = {
-    avatarName: string;
-    ownerId: string;
-    fileId: string;
-    version: number;
-    updatedAt: string;
-    performanceRating?: string | null;
-  };
-
-  let search = '';
-  let offset = 0;
-  const PAGE_SIZE = 100;
-  let total = 0;
-  let items: AvatarEntry[] = [];
-  let loading = false;
-  let errorMsg: string | null = null;
-
-  async function loadEntries(newOffset = 0) {
-    loading = true;
-    errorMsg = null;
-    try {
-      const res: any = await invoke('list_distinct_avatar_details', {
-        offset: newOffset,
-        limit: PAGE_SIZE,
-        search
-      });
-      offset = newOffset;
-      total = Number(res?.total || 0);
-      items = Array.isArray(res?.items) ? res.items.map((entry: any) => ({
-        avatarName: entry.avatarName || '',
-        ownerId: entry.ownerId || 'unknown_owner',
-        fileId: entry.fileId || '',
-        version: entry.version || 0,
-        updatedAt: entry.updatedAt || '',
-        performanceRating: entry.performanceRating ?? null,
-      })) : [];
-    } catch (err) {
-      errorMsg = err instanceof Error ? err.message : String(err ?? 'Unknown error');
-      items = [];
-    } finally {
-      loading = false;
-    }
-  }
-
-  function nextPage() {
-    if (offset + PAGE_SIZE >= total) return;
-    void loadEntries(offset + PAGE_SIZE);
-  }
-
-  function prevPage() {
-    if (offset === 0) return;
-    const newOffset = Math.max(0, offset - PAGE_SIZE);
-    void loadEntries(newOffset);
-  }
-
-  function applySearch() {
-    offset = 0;
-    void loadEntries(0);
-  }
-
-  onMount(() => {
-    void loadEntries(0);
   });
-
-function formatTitle(item: MediaItem): string {
-  const owner = item.ownerName || item.ownerId || 'Unknown';
-  return `[ ${getDisplayType(item)} | ${owner} ]`;
-}
 </script>
 
-<div class="page">
-  <div class="header" role="tablist">
-    <div class="tabs">
-      {#each tabs as t}
-        <button
-          role="tab"
-          aria-selected={tab === t.id}
-          class:active={tab === t.id}
-          onclick={() => selectTab(t.id)}
-        >
-          {t.label}
-        </button>
-      {/each}
+<div class="panel" bind:this={containerElement}>
+  <div class="header">
+    <h2>Moderation Logs - World Staff (Not Group Moderation)</h2>
+    <div class="search-container">
+      <input
+        type="text"
+        placeholder="Search by admin or target..."
+        bind:value={searchQuery}
+        oninput={onSearchInput}
+        class="search-input"
+      />
     </div>
-    <button class="clear-button" onclick={clearMediaItems} disabled={clearing}>
-      {clearing ? 'Clearing…' : 'Clear Media'}
-    </button>
   </div>
 
-  <section class="content">
-    {#if tab === 'avatar'}
-      <div class="panel" role="tabpanel">
-        <h2>Avatar Logs</h2>
-        <div class="controls">
-          <input
-            placeholder="Search avatar name..."
-            bind:value={search}
-            onkeydown={(e) => {
-              if (e.key === 'Enter') applySearch();
-            }}
-          />
-          <button class="ghost" onclick={applySearch} disabled={loading}>Search</button>
-        </div>
-        {#if errorMsg}
-          <div class="error">{errorMsg}</div>
-        {:else if loading}
-          <div class="loading">Loading…</div>
-        {:else if items.length === 0}
-          <div class="empty">No avatar records found.</div>
+  <div class="logs-container">
+    {#if banLogs.length === 0}
+      <div class="empty">
+        {#if searchQuery.trim()}
+          No moderation logs found matching "{searchQuery}"
         {:else}
-          <div class="table-wrapper">
-            <table>
-              <thead>
-                <tr>
-                  <th>Avatar</th>
-                  <th>Owner</th>
-                  <th>Version</th>
-                  <th>Performance</th>
-                  <th>File ID</th>
-                  <th>Updated</th>
-                </tr>
-              </thead>
-              <tbody>
-                {#each items as entry}
-                  <tr>
-                    <td>{entry.avatarName}</td>
-                    <td>{entry.ownerId}</td>
-                    <td>{entry.version}</td>
-                    <td>{entry.performanceRating ?? '—'}</td>
-                    <td title={entry.fileId}>{entry.fileId || '—'}</td>
-                    <td>{entry.updatedAt}</td>
-                  </tr>
-                {/each}
-              </tbody>
-            </table>
-          </div>
-          <div class="pager">
-            <button onclick={prevPage} disabled={offset === 0 || loading}>Prev</button>
-            <span>{Math.floor(offset / PAGE_SIZE) + 1} / {Math.max(1, Math.ceil(total / PAGE_SIZE))}</span>
-            <button onclick={nextPage} disabled={offset + PAGE_SIZE >= total || loading}>Next</button>
-          </div>
+          No moderation logs yet. Ban/warn events will appear here when detected in VRChat logs.
         {/if}
       </div>
     {:else}
-      {@const activeItems = activeMediaTabItems}
-      {@const currentLabel = tabs.find((t) => t.id === tab)?.label ?? ''}
-      <div class="panel" role="tabpanel">
-        <div class="panel-header">
-          <h2>{currentLabel} Gallery</h2>
-          <p class="panel-subtitle">Browse captured {currentLabel.toLowerCase()} assets. Select an item to view details.</p>
-        </div>
-        {#if activeItems.length === 0}
-          <div class="empty">No items available yet.</div>
-        {:else}
-          <div class="media-grid" role="list">
-            {#each activeItems as item}
-              <MediaCard
-                item={{
-                  id: item.id,
-                  label: `${getDisplayType(item, tab)} :: ${item.ownerName || item.ownerId || 'Unknown'}`,
-                  image: item.imageUrl,
-                  type: item.itemType
-                }}
-                on:select={() => openItem(item)}
-              />
-            {/each}
+      <div class="logs-list">
+        {#each banLogs as entry (entry.id)}
+          <div class="log-entry" class:ban={entry.action_type === 'ban'} class:warn={entry.action_type === 'warn'}>
+            <div class="action-badge" class:ban={entry.action_type === 'ban'} class:warn={entry.action_type === 'warn'}>
+              {entry.action_type === 'ban' ? 'Ban' : 'Warn'}
+            </div>
+            <div class="log-header">
+              <div class="log-meta">
+                <span class="admin">Admin: <strong>{entry.admin}</strong></span>
+                <span class="target">Target: <strong>{entry.target}</strong></span>
+                <span class="timestamp">{entry.timestamp}</span>
+              </div>
+            </div>
+            <div class="log-reason">
+              <span class="reason-label">Reason:</span>
+              <span class="reason-text">{entry.reason}</span>
+            </div>
           </div>
-        {/if}
+        {/each}
       </div>
     {/if}
-  </section>
+  </div>
 </div>
 
-{#if selectedItem}
-  <div class="modal-backdrop" role="button" aria-label="Close preview" tabindex="0" onclick={closeItem} onkeydown={(e) => { if (e.key === 'Escape' || e.key === 'Enter' || e.key === ' ') { e.preventDefault(); closeItem(); }}}>
-    <div class="modal" role="dialog" aria-modal="true" onclick={(e) => e.stopPropagation()}>
-      <header>
-        <h3>{selectedItem ? formatTitle(selectedItem) : ''}</h3>
-        <button class="close" aria-label="Close" onclick={closeItem}>×</button>
-      </header>
-      <div class="modal-body">
-        <div class="modal-thumb" data-item-type={selectedItem?.itemType}>
-          {#if selectedItem?.imageUrl}
-            <img src={selectedItem.imageUrl} alt={selectedItem.id} />
-          {:else}
-            <div class="placeholder">No image available</div>
-          {/if}
-        </div>
-        <div class="meta">
-          <div class="row"><strong>Image:</strong> {selectedItem?.imageUrl || '—'}</div>
-          <div class="row"><strong>Owner:</strong> {selectedItem?.ownerName || selectedItem?.ownerId || 'Unknown'}</div>
-          <div class="row"><strong>Fetched:</strong> {selectedItem?.fetchedAt}</div>
-        </div>
-        <button
-          class="report-button"
-          title="Export emoji to a private VRC dev channel to help VRChat improve their systems!"
-          onclick={reportSelectedItem}
-          disabled={reporting || !selectedItem?.imageUrl}
-        >
-          {reporting ? 'Reporting…' : 'Instant Report'}
-        </button>
-      </div>
-    </div>
-  </div>
-{/if}
-
 <style>
-  .page {
+  .panel {
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 16px;
+    height: 100%;
   }
 
   .header {
     display: flex;
-    justify-content: flex-start;
-    gap: 12px;
-    align-items: center;
-  }
-
-  .tabs {
-    display: inline-flex;
-    gap: 8px;
-  }
-
-  .header .clear-button {
-    margin-left: auto;
-    border: 1px solid var(--border);
-    background: var(--bg);
-    color: var(--fg);
-    border-radius: 8px;
-    padding: 6px 12px;
-    cursor: pointer;
-    font-weight: 600;
-  }
-
-  .header .clear-button:disabled {
-    opacity: 0.6;
-    cursor: not-allowed;
-  }
-
-  .tabs button {
-    height: 36px;
-    padding: 0 14px;
-    border-radius: 8px;
-    border: 1px solid var(--border);
-    background: var(--bg);
-    color: var(--fg);
-    cursor: pointer;
-    font-weight: 600;
-  }
-
-  .tabs button.active {
-    background: var(--bg-elev);
-    border-color: var(--fg-muted);
-  }
-
-  .content {
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    background: var(--bg-elev);
-    padding: 16px;
-  }
-
-  .panel {
-    display: grid;
+    flex-direction: column;
     gap: 12px;
   }
 
   h2 {
     margin: 0;
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--fg);
   }
 
-  p {
-    margin: 0;
-    color: var(--fg-muted);
+  .search-container {
+    display: flex;
+    gap: 8px;
   }
 
-  .panel-subtitle {
+  .search-input {
+    flex: 1;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--fg);
+    border-radius: 8px;
+    padding: 8px 12px;
     font-size: 13px;
   }
 
-  .panel-header {
-    display: grid;
-    gap: 6px;
+  .search-input:focus {
+    outline: none;
+    border-color: var(--accent);
   }
 
-  .controls {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-    align-items: center;
-  }
-
-  .controls input {
+  .logs-container {
     flex: 1;
-    min-width: 240px;
-    border-radius: 8px;
-    border: 1px solid var(--border);
-    background: var(--bg);
-    color: var(--fg);
-    padding: 6px 10px;
-  }
-
-  .controls button {
-    border: 1px solid var(--border);
-    background: var(--bg);
-    color: var(--fg);
-    border-radius: 8px;
-    padding: 6px 12px;
-    cursor: pointer;
-  }
-
-  .controls button:disabled {
-    opacity: 0.6;
-    cursor: not-allowed;
-  }
-
-  .table-wrapper {
-    overflow: auto;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-  }
-
-  table {
-    width: 100%;
-    border-collapse: collapse;
-  }
-
-  th, td {
-    padding: 8px 10px;
-    border-bottom: 1px solid var(--border);
-    text-align: left;
-  }
-
-  th {
-    background: rgba(255,255,255,0.05);
-    font-weight: 600;
-  }
-
-  tr:last-child td {
-    border-bottom: none;
-  }
-
-  .pager {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    justify-content: flex-end;
-  }
-
-  .pager button {
-    border: 1px solid var(--border);
-    background: var(--bg);
-    color: var(--fg);
-    border-radius: 8px;
-    padding: 4px 10px;
-    cursor: pointer;
-  }
-
-  .pager button:disabled {
-    opacity: 0.6;
-    cursor: not-allowed;
-  }
-
-  .empty, .loading, .error {
-    color: var(--fg-muted);
-    padding: 12px 0;
-  }
-
-  .error {
-    color: var(--fg-err);
-  }
-
-  .media-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-    gap: 12px;
-    max-height: calc(100vh - 340px);
+    min-height: 0;
     overflow-y: auto;
-    padding-right: 4px;
-  }
-
-  .media-card {
-    display: grid;
-    gap: 8px;
     border: 1px solid var(--border);
-    border-radius: 10px;
-    background: var(--bg);
-    color: var(--fg);
-    padding: 8px;
-    cursor: pointer;
-    text-align: left;
-    transition: border-color 0.2s ease, transform 0.2s ease;
+    border-radius: 12px;
+    background: var(--bg-elev);
+    padding: 12px;
   }
 
-  .media-card:hover {
-    border-color: var(--accent, #ffb6c1);
-    transform: translateY(-1px);
-  }
-
-  .media-card:focus-visible {
-    outline: 2px solid var(--accent, #ffb6c1);
-    outline-offset: 2px;
-  }
-
-  .media-thumb {
-    position: relative;
-    width: 100%;
-    aspect-ratio: 16 / 9;
-    overflow: hidden;
-    border-radius: 8px;
-    background: rgba(255, 255, 255, 0.04);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-
-  .media-thumb img {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-  }
-
-  .media-title {
-    font-weight: 600;
+  .empty {
+    padding: 32px;
+    text-align: center;
+    color: var(--fg-muted);
     font-size: 14px;
   }
 
-  .modal-backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.65);
+  .logs-list {
     display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 1000;
+    flex-direction: column;
+    gap: 12px;
   }
 
-  .modal {
-    width: min(720px, 92vw);
-    background: var(--bg-elev);
-    color: var(--fg);
+  .log-entry {
     border: 1px solid var(--border);
-    border-radius: 14px;
-    box-shadow: 0 24px 70px rgba(0, 0, 0, 0.45);
-    display: grid;
-    grid-template-rows: auto 1fr;
-    max-height: 90vh;
+    border-radius: 8px;
+    padding: 0;
+    background: var(--bg);
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    position: relative;
+    overflow: hidden;
   }
 
-  .modal header {
+  .log-entry.ban {
+    border-color: rgba(255, 80, 80, 0.5);
+    box-shadow: 0 0 12px rgba(255, 80, 80, 0.3), inset 0 0 20px rgba(255, 80, 80, 0.1);
+  }
+
+  .log-entry.warn {
+    border-color: rgba(255, 180, 0, 0.5);
+    box-shadow: 0 0 12px rgba(255, 180, 0, 0.3), inset 0 0 20px rgba(255, 180, 0, 0.1);
+  }
+
+  .action-badge {
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    text-align: center;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .action-badge.ban {
+    background: rgba(255, 80, 80, 0.2);
+    color: #ff5050;
+    text-shadow: 0 0 8px rgba(255, 80, 80, 0.8);
+  }
+
+  .action-badge.warn {
+    background: rgba(255, 180, 0, 0.2);
+    color: #ffb400;
+    text-shadow: 0 0 8px rgba(255, 180, 0, 0.8);
+  }
+
+  .log-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 14px 18px;
-    border-bottom: 1px solid var(--border);
+    padding: 12px;
   }
 
-  .modal header h3 {
-    margin: 0;
-    font-size: 18px;
+  .log-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+    font-size: 13px;
   }
 
-  .modal .close {
-    border: none;
-    background: transparent;
+  .admin,
+  .target {
+    color: var(--fg-muted);
+  }
+
+  .admin strong,
+  .target strong {
     color: var(--fg);
-    font-size: 22px;
-    cursor: pointer;
-    line-height: 1;
-  }
-
-  .modal-body {
-    padding: 18px;
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
-    align-items: stretch;
-    overflow-y: auto;
-  }
-
-  .modal-thumb {
-    width: 100%;
-    aspect-ratio: 16 / 9;
-    flex: 0 0 auto;
-    border-radius: 10px;
-    overflow: hidden;
-    background: rgba(255, 255, 255, 0.06);
-  }
-
-  .modal-thumb img {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-  }
-
-  .modal-thumb[data-item-type="emoji"],
-  .modal-thumb[data-item-type="sticker"] {
-    aspect-ratio: 1 / 1;
-  }
-
-  .meta {
-    display: grid;
-    gap: 10px;
-    font-size: 14px;
-  }
-
-  .report-button {
-    align-self: flex-start;
-    border: none;
-    border-radius: 8px;
-    padding: 8px 14px;
-    background: #b3261e;
-    color: #fff;
     font-weight: 600;
-    cursor: pointer;
-    transition: filter 0.2s ease;
   }
 
-  .report-button:hover:enabled {
-    filter: brightness(1.1);
+  .timestamp {
+    color: var(--fg-muted);
+    font-size: 12px;
+    margin-left: auto;
   }
 
-  .report-button:disabled {
-    opacity: 0.7;
-    cursor: not-allowed;
-  }
-
-  .meta .row {
-    display: grid;
-    grid-template-columns: 130px 1fr;
-    gap: 8px;
-  }
-
-  .meta a {
-    color: var(--accent, #ffb6c1);
-    word-break: break-all;
-  }
-
-  .modal {
+  .log-reason {
     display: flex;
-    flex-direction: column;
+    gap: 8px;
+    padding: 12px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
   }
 
-  .modal .body,
-  .modal-body {
-    overflow-y: auto;
+  .reason-label {
+    color: var(--fg-muted);
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
+  .reason-text {
+    color: var(--fg);
+    font-size: 13px;
+    flex: 1;
   }
 </style>
-

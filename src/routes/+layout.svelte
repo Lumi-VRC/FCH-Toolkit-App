@@ -1,265 +1,258 @@
 <script lang="ts">
-import Sidebar from '$lib/components/Sidebar.svelte';
-import LoginPage from './+page.svelte';
-import InstanceMonitor from './instance-monitor/+page.svelte';
-import LogExplorer from './log-explorer/+page.svelte';
-import DatabasePage from './database/+page.svelte';
-import SettingsPanel from './settings/+page.svelte';
-import DebugPanel from './debug/+page.svelte';
-import WorldModeration from './world-moderation/+page.svelte';
-import { onDestroy, onMount } from 'svelte';
-import { invoke } from '@tauri-apps/api/core';
-import { pushDebug, setApiQueueLength } from '$lib/stores/debugLog';
-import { getResultsStore, pushResult } from '$lib/stores/apiChecks';
-import { markLiveViewListenersReady, waitForLiveViewListenersReady } from '$lib/liveViewReady';
+  import { onMount, onDestroy } from 'svelte';
+  import Sidebar from '$lib/components/Sidebar.svelte';
+  import LoginPage from './+page.svelte';
+  import InstanceMonitor from './instance-monitor/+page.svelte';
+  import DatabasePage from './database/+page.svelte';
+  import LogExplorer from './log-explorer/+page.svelte';
+  import WorldModeration from './world-moderation/+page.svelte';
+  import SettingsPanel from './settings/+page.svelte';
+  import DebugPanel from './debug/+page.svelte';
+  import AboutPage from './about/+page.svelte';
+  import { isLoading, loadingMessage } from '$lib/stores/loading';
+  import { pushDebug } from '$lib/stores/debugLog';
+
   let collapsed = $state(true);
   let activeIndex = $state(0);
+  let mouseX = $state(0.5); // Normalized 0-1
+  let mouseY = $state(0.5); // Normalized 0-1
+  let appElement;
+  let petalInterval = null;
+  let isAppLoading = $state(true);
+  let currentLoadingMessage = $state('Initializing...');
+  let showWelcome = $state(false);
+  let welcomeFading = $state(false);
+  let previousLoadingState = true;
 
-  function toggleSidebar() { collapsed = !collapsed; }
-  function selectTab(i: number) { activeIndex = i; }
+  // Subscribe to loading store
+  const unsubscribeLoading = isLoading.subscribe(value => {
+    const wasLoading = previousLoadingState;
+    previousLoadingState = value;
+    isAppLoading = value;
+    
+    // When loading ends, show welcome screen
+    if (wasLoading && !value) {
+      showWelcome = true;
+      welcomeFading = false;
+      
+      // Start fade out after 2 seconds
+      setTimeout(() => {
+        welcomeFading = true;
+        // Remove welcome screen after fade completes
+        setTimeout(() => {
+          showWelcome = false;
+        }, 2000); // Match fade duration
+      }, 2000);
+    }
+  });
+  
+  const unsubscribeMessage = loadingMessage.subscribe(value => {
+    currentLoadingMessage = value;
+  });
 
-const tabs = [
-  { title: 'Login', component: LoginPage },
-  { title: 'Instance Monitor', component: InstanceMonitor },
-  { title: 'Database', component: DatabasePage },
-  { title: 'Log Explorer', component: LogExplorer },
-  { title: 'World Moderation', component: WorldModeration },
-  { title: 'Settings', component: SettingsPanel },
-  { title: 'Debug', component: DebugPanel },
-  { title: 'About', component: null }
-];
+  const tabs = [
+    { title: 'Login', component: LoginPage },
+    { title: 'Instance Monitor', component: InstanceMonitor },
+    { title: 'Database', component: DatabasePage },
+    { title: 'Log Explorer', component: LogExplorer },
+    { title: 'World Moderation', component: WorldModeration },
+    { title: 'Settings', component: SettingsPanel },
+    { title: 'Debug', component: DebugPanel },
+    { title: 'About', component: AboutPage }
+  ];
 
-const tabTitles = tabs.map((tab) => tab.title);
+  const tabTitles = tabs.map((tab) => tab.title);
 
-  // Global join-driven group watch batching (runs regardless of active tab)
-  let joinBatch = $state(new Set<string>());
-  const JOIN_BATCH_DELAY = 400;
-  const JOIN_BATCH_MAX = 100;
-  let batchTimer: any = null;
-
-  function scheduleBatchWatchCheck() {
-    if (joinBatch.size >= JOIN_BATCH_MAX) { void flushJoinBatch(); return; }
-    if (batchTimer) return;
-    batchTimer = setTimeout(() => { void flushJoinBatch(); }, JOIN_BATCH_DELAY);
+  function toggleSidebar() {
+    collapsed = !collapsed;
   }
 
-  async function flushJoinBatch() {
-    batchTimer = null;
-    const userIds = Array.from(joinBatch);
-    joinBatch = new Set();
-    if (userIds.length === 0) return;
+  function selectTab(i) {
+    activeIndex = i;
+  }
 
-    let tokens: string[] = [];
-    try {
-      const res: any = await invoke('list_group_access_tokens');
-      tokens = (Array.isArray(res) ? res : []).map((g: any) => String(g.token || '')).filter((t: string) => t.length >= 32);
-    } catch {}
-    if (tokens.length === 0) {
-      pushDebug('[group-watch] abort :: no tokens available');
-      return;
+  function handleMouseMove(e) {
+    if (!appElement) return;
+    
+    const rect = appElement.getBoundingClientRect();
+    // Normalize mouse position to 0-1 range
+    mouseX = (e.clientX - rect.left) / rect.width;
+    mouseY = (e.clientY - rect.top) / rect.height;
+    
+    // Update CSS custom properties for parallax
+    appElement.style.setProperty('--mouse-x', mouseX.toString());
+    appElement.style.setProperty('--mouse-y', mouseY.toString());
+  }
+
+  function isOverUIElement(x, y) {
+    // Check if point is over UI elements (sidebar, header, content areas)
+    if (!appElement) return false;
+    
+    const sidebar = appElement.querySelector('aside, [class*="sidebar"]');
+    const header = appElement.querySelector('header');
+    const main = appElement.querySelector('main');
+    
+    // Check sidebar
+    if (sidebar) {
+      const rect = sidebar.getBoundingClientRect();
+      if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
+        return true;
+      }
     }
+    
+    // Check header
+    if (header) {
+      const rect = header.getBoundingClientRect();
+      if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
+        return true;
+      }
+    }
+    
+    // Check main content area (but not the background)
+    if (main) {
+      const rect = main.getBoundingClientRect();
+      if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
+        return true;
+      }
+    }
+    
+    return false;
+  }
 
-    const API_BASE: string = (import.meta as any)?.env?.VITE_API_BASE || 'https://fch-toolkit.com';
-    try {
-      console.debug('[group-batch] sending', { userIdsCount: userIds.length, tokensCount: tokens.length });
-      pushDebug(`[group-watch] batch start :: users=${userIds.length} tokens=${tokens.length}`);
-      const resp = await fetch(`${API_BASE}/check-user`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userIds, tokens }) });
-      if (!resp.ok) {
-        pushDebug(`[group-watch] server responded ${resp.status} ${resp.statusText}`);
-        return;
-      }
-      const data: any = await resp.json();
-      if (data && (Array.isArray(data.matches) || Array.isArray(data.aggregates))) {
-        // Merge into global cache for hydration when tabs mount later
-        try {
-          pushDebug(`[group-watch] received matches=${(data.matches || []).length} aggregates=${(data.aggregates || []).length}`);
-          const w: any = window as any;
-          const cache = w.__FCH_GROUP_WATCH_CACHE__ || { flags: {}, matchesByUser: {}, aggregates: {} };
-          for (const m of (data.matches || [])) {
-            const uid = String(m.user_id);
-            const watchlist = Boolean(m.watchlist);
-            const notes = m.notes ? String(m.notes) : undefined;
-            const prevFlag = cache.flags[uid] || {};
-            cache.flags[uid] = { watchlist: Boolean(prevFlag.watchlist) || watchlist, notes: prevFlag.notes || notes };
-            const arr = cache.matchesByUser[uid] || [];
-            if (!arr.find((x: any) => String(x.group_id) === String(m.group_id))) {
-              arr.push({ group_id: String(m.group_id), groupName: m.groupName, notes, watchlist });
-            }
-            cache.matchesByUser[uid] = arr;
-          }
-          for (const a of (data.aggregates || [])) {
-            const uid = String(a.user_id);
-            cache.aggregates[uid] = { warns: Number(a.warns)||0, kicks: Number(a.kicks)||0, bans: Number(a.bans)||0 };
-          }
-          w.__FCH_GROUP_WATCH_CACHE__ = cache;
-        } catch {}
-        // Play one sound per batch if any matched watchlisted users
-        try {
-          const matchedUserIds = Array.from(new Set((data.matches || []).filter((m: any) => Boolean(m.watchlist)).map((m: any) => String(m.user_id))));
-          if (matchedUserIds.length > 0) {
-            console.debug('[sound] group_watchlist', { matchedCount: matchedUserIds.length, userIds: matchedUserIds });
-            pushDebug(`[group-watch] playing group sound for ${matchedUserIds.length} user(s)`);
-            try { await invoke('preview_group_sound'); } catch (err) { pushDebug(`[group-watch] group sound failed :: ${err}`); }
-          }
-        } catch {}
-        // Persist group flags in DB for join logs backfill (no sound here)
-        try {
-          const matchedUserIds = Array.from(new Set((data.matches || []).filter((m: any) => Boolean(m.watchlist)).map((m: any) => String(m.user_id))));
-          if (matchedUserIds.length > 0) {
-            try {
-              const changed = await invoke<number>('set_group_watchlisted_for_users', { userIds: matchedUserIds });
-              pushDebug(`[group-watch] persisted watch flags for ${matchedUserIds.length} user(s) :: rowsUpdated=${changed}`);
-            } catch (err) {
-              pushDebug(`[group-watch] failed to persist watch flags :: ${err}`);
-            }
-          }
-        } catch {}
-        // Broadcast results so UI (Instance Monitor) can update flags if mounted
-        try {
-          const evt = new CustomEvent('group_watch_results', { detail: { matches: data.matches || [], aggregates: data.aggregates || [] } });
-          window.dispatchEvent(evt);
-          pushDebug(`[group-watch] dispatched results event`);
-        } catch {}
-      }
-    } catch (err) {
-      pushDebug(`[group-watch] batch error :: ${err}`);
+  function updatePetalOpacity(petal) {
+    const rect = petal.getBoundingClientRect();
+    const centerX = rect.left + rect.width / 2;
+    const centerY = rect.top + rect.height / 2;
+    
+    if (isOverUIElement(centerX, centerY)) {
+      petal.style.opacity = '0.1';
+    } else {
+      petal.style.opacity = '0.6';
     }
   }
 
-  onMount(() => {
-    let unlistenInserted: undefined | (() => void);
-    let unlistenSound: undefined | (() => void);
-    let unlistenDebug: undefined | (() => void);
-    let unlistenApiQueue: undefined | (() => void);
-    let unlistenApiResults: undefined | (() => void);
-    const teardown: Array<() => void | Promise<void>> = [];
-    let unsubscribeApiResults: undefined | (() => void);
-    (async () => {
-      try {
-        const { listen } = await import('@tauri-apps/api/event');
-        const ensureUnsub = (handler: () => void | Promise<void>) => {
-          let removed = false;
-          return async () => {
-            if (!removed) {
-              removed = true;
-              try {
-                await handler();
-              } catch {}
-            }
-          };
-        };
+  function createPetal() {
+    const petal = document.createElement('div');
+    petal.className = 'sakura-petal';
 
-        unlistenInserted = await listen('db_row_inserted', (e: any) => {
-          const p = e?.payload || {};
-          if (p && !p.type && p.userId) {
-            joinBatch.add(String(p.userId));
-            scheduleBatchWatchCheck();
-          }
-        });
-        teardown.push(ensureUnsub(unlistenInserted));
+    const startX = Math.random() * window.innerWidth;
+    petal.style.left = `${startX}px`;
 
-        unlistenApiQueue = await listen('api_queue_length', (event: any) => {
-          const len = Number(event?.payload ?? 0);
-          setApiQueueLength(Number.isFinite(len) ? len : 0);
-        });
-        teardown.push(ensureUnsub(unlistenApiQueue));
+    const initialRotate = Math.random() * 360;
+    petal.style.setProperty('--initialRotate', `${initialRotate}deg`);
+    petal.style.transform = `rotate(${initialRotate}deg) scaleX(0.5)`;
 
-        unlistenSound = await listen('sound_triggered', (e: any) => {
-          const payload = e?.payload || {};
-          console.debug('[sound] local_watchlist', payload);
-          pushDebug(`[sound] local watch triggered :: ${JSON.stringify(payload)}`);
-        });
-        teardown.push(ensureUnsub(unlistenSound));
+    const duration = 5 + Math.random() * 5; // 5 to 10 seconds
+    const angleDegrees = (Math.random() * 20) - 10;
+    const translateX = Math.tan(angleDegrees * (Math.PI / 180)) * window.innerHeight;
+    const deltaRotate = (Math.random() * 180) - 90;
 
-        unlistenDebug = await listen('debug_log', (e: any) => {
-          const { message, ts } = e?.payload || {};
-          if (typeof message === 'string') {
-            pushDebug(message, typeof ts === 'string' ? ts : undefined);
-          }
-        });
-        teardown.push(ensureUnsub(unlistenDebug));
+    petal.style.setProperty('--translateX', `${translateX}px`);
+    petal.style.setProperty('--deltaRotate', `${deltaRotate}deg`);
+    petal.style.animation = `fall ${duration}s linear forwards`;
+    petal.style.opacity = '0.6'; // Default opacity when over background
 
-        unlistenApiResults = await listen('api_checks_result', async (e: any) => {
-          const payload = e?.payload;
-          if (!payload || typeof payload !== 'object') return;
+    // Update opacity periodically as petal falls
+    const opacityInterval = setInterval(() => {
+      if (petal.parentNode) {
+        updatePetalOpacity(petal);
+      } else {
+        clearInterval(opacityInterval);
+      }
+    }, 100); // Check every 100ms
 
-          const normalized = Object.entries(payload).reduce((acc, [key, value]) => {
-            const camelKey = key.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
-            acc[camelKey] = value;
-            return acc;
-          }, {} as Record<string, unknown>);
-
-          pushDebug(
-            `[avatarData] file=${String((normalized as any).fileId ?? '')} v=${String((normalized as any).version ?? '')} :: file=${JSON.stringify((normalized as any).file ?? null)} :: security=${JSON.stringify((normalized as any).security ?? null)}`
-          );
-
-          pushResult({
-            file_id: String((normalized as any).fileId ?? ''),
-            version: Number((normalized as any).version ?? 0),
-            success: Boolean((normalized as any).success !== false),
-            errors: Array.isArray((normalized as any).errors)
-              ? ((normalized as any).errors as string[])
-              : (normalized as any).error
-              ? [String((normalized as any).error)]
-              : undefined,
-            timestamp:
-              typeof (normalized as any).timestamp === 'string'
-                ? (normalized as any).timestamp
-                : undefined,
-            file: (normalized as any).file,
-            security: (normalized as any).security,
-            raw: payload,
-          });
-        });
-        teardown.push(ensureUnsub(unlistenApiResults));
-
-        markLiveViewListenersReady();
-      } catch {}
-
-      await waitForLiveViewListenersReady();
-
-      try {
-        await invoke('start_log_watcher');
-      } catch {}
-      pushDebug('[VRCAPI] apiChecks ready (HTTP mode)');
-      unsubscribeApiResults = getResultsStore().subscribe((entries) => {
-        const latest = entries[entries.length - 1];
-        if (!latest) return;
-        pushDebug(
-          `[VRCAPI] apiChecks completed :: ${latest.file_id} v${latest.version} :: success=${latest.success}`
-        );
-      });
-      try { await invoke('dedupe_open_joins'); } catch {}
-      try {
-        const initial: any[] = await invoke('get_active_join_logs');
-        const userIds = Array.from(new Set((Array.isArray(initial) ? initial : []).map((r: any) => String(r.userId)).filter(Boolean)));
-        if (userIds.length > 0) {
-          userIds.forEach((uid) => joinBatch.add(uid));
-          await flushJoinBatch();
-        }
-      } catch {}
-    })();
-    onDestroy(async () => {
-      try {
-        if (batchTimer) clearTimeout(batchTimer);
-        unsubscribeApiResults?.();
-        const tasks = [...teardown];
-        if (unlistenApiQueue) tasks.push(unlistenApiQueue);
-        if (unlistenInserted) tasks.push(unlistenInserted);
-        if (unlistenSound) tasks.push(unlistenSound);
-        if (unlistenDebug) tasks.push(unlistenDebug);
-        if (unlistenApiResults) tasks.push(unlistenApiResults);
-        for (const task of tasks) {
-          try {
-            await task();
-          } catch {}
-        }
-      } catch {}
+    petal.addEventListener('animationend', () => {
+      clearInterval(opacityInterval);
+      petal.remove();
     });
+
+    document.body.appendChild(petal);
+    // Initial opacity check
+    setTimeout(() => updatePetalOpacity(petal), 10);
+  }
+
+  onMount(async () => {
+    // Initialize debug logging
+    pushDebug('[App] Application starting...', undefined, 'info', 'frontend');
+    
+    // Initialize loading state
+    isLoading.set(true);
+    loadingMessage.set('Starting application...');
+    
+    // Small delay to ensure UI is rendered
+    await new Promise(resolve => setTimeout(resolve, 100));
+    
+    if (appElement) {
+      appElement.addEventListener('mousemove', handleMouseMove);
+    }
+    
+    // Create a petal every 500ms
+    petalInterval = setInterval(createPetal, 500);
+    
+    // Fallback: dismiss loading screen after maximum wait time (10 seconds)
+    // This ensures the app doesn't stay frozen if something goes wrong
+    // Increased from 3s to 10s to allow retroactive log scan to complete
+    setTimeout(() => {
+      if (isAppLoading) {
+        console.warn('[Loading] Fallback timeout reached, dismissing loading screen');
+        isLoading.set(false);
+        // Force a re-render by updating state
+        isAppLoading = false;
+      }
+    }, 10000);
+    
+    // Wait a bit for initial setup, then allow components to signal completion
+    // The loading will be dismissed by individual components when they're ready
+    setTimeout(() => {
+      // Minimum loading time to prevent flash
+      if (isAppLoading) {
+        loadingMessage.set('Loading components...');
+      }
+    }, 300);
+  });
+
+  onDestroy(() => {
+    if (appElement) {
+      appElement.removeEventListener('mousemove', handleMouseMove);
+    }
+    if (petalInterval) {
+      clearInterval(petalInterval);
+    }
+    unsubscribeLoading();
+    unsubscribeMessage();
   });
 </script>
 
-<div class="app">
+<svelte:head>
+  <style>
+    @keyframes fall {
+      to {
+        transform: translateY(105vh) translateX(var(--translateX)) rotate(calc(var(--initialRotate) + var(--deltaRotate))) scaleX(0.5);
+        opacity: 0;
+      }
+    }
+  </style>
+</svelte:head>
+
+<div class="app" bind:this={appElement}>
+  {#if isAppLoading}
+    <div class="loading-overlay">
+      <div class="loading-content">
+        <div class="loading-spinner"></div>
+        <div class="loading-text">{currentLoadingMessage}</div>
+      </div>
+    </div>
+  {/if}
+
+  {#if showWelcome}
+    <div class="welcome-overlay" class:fading={welcomeFading}>
+      <div class="welcome-content">
+        <img src="/IconNOBG.png" alt="FCH Toolkit" class="welcome-icon" />
+        <div class="welcome-text">Welcome to FCH Toolkit</div>
+      </div>
+    </div>
+  {/if}
+
   <Sidebar {collapsed} {activeIndex} onToggle={toggleSidebar} onSelect={selectTab} />
 
   <main>
@@ -274,7 +267,8 @@ const tabTitles = tabs.map((tab) => tab.title);
           aria-hidden={activeIndex === index ? undefined : 'true'}
         >
           {#if tab.component}
-            <svelte:component this={tab.component} />
+            {@const C = tab.component}
+            <C />
           {:else}
             <div class="placeholder">
               <p>Content for <strong>{tab.title}</strong> will appear here.</p>
@@ -291,6 +285,82 @@ const tabTitles = tabs.map((tab) => tab.title);
   :global(body) { margin: 0; background: var(--bg); color: var(--fg); font-family: system-ui, Segoe UI, Roboto, Arial, sans-serif; }
   :global(*), :global(*::before), :global(*::after) { box-sizing: border-box; }
 
+  /* CSS Variables - Dark gray theme */
+  :global(:root) {
+    --bg: #121212;
+    --bg-elev: #1a1a1a;
+    --bg-hover: #222222;
+    --fg: #e0e0e0;
+    --fg-muted: #999999;
+    --accent: #ffb6c1;
+    --border: #333333;
+  }
+
+  /* Custom scrollbar styling */
+  :global(::-webkit-scrollbar) {
+    width: 12px;
+    height: 12px;
+  }
+
+  :global(::-webkit-scrollbar-track) {
+    background: #1a1a1a;
+    border: 1px solid #ffb6c1;
+  }
+
+  :global(::-webkit-scrollbar-thumb) {
+    background: #ffb6c1;
+    border-radius: 6px;
+    border: 1px solid #ffb6c1;
+  }
+
+  :global(::-webkit-scrollbar-thumb:hover) {
+    background: #ff9fb8;
+  }
+
+  /* Firefox scrollbar styling */
+  :global(*) {
+    scrollbar-width: thin;
+    scrollbar-color: #ffb6c1 #1a1a1a;
+  }
+
+  /* Hoverable buttons and search bars - faint glow effect */
+  :global(button:not(:disabled)),
+  :global(input[type="text"]),
+  :global(input[type="search"]),
+  :global(textarea),
+  :global(select),
+  :global(.search-input),
+  :global(.control-btn),
+  :global(.watch-btn),
+  :global(.note-btn),
+  :global(.toggle),
+  :global([role="button"]:not(:disabled)) {
+    box-shadow: 0 0 2px rgba(255, 182, 193, 0.4);
+    transition: box-shadow 0.2s ease;
+  }
+
+  /* Extended glow on focus/click */
+  :global(button:not(:disabled):focus),
+  :global(button:not(:disabled):active),
+  :global(input[type="text"]:focus),
+  :global(input[type="search"]:focus),
+  :global(textarea:focus),
+  :global(select:focus),
+  :global(.search-input:focus),
+  :global(.control-btn:focus),
+  :global(.control-btn:active),
+  :global(.watch-btn:focus),
+  :global(.watch-btn:active),
+  :global(.note-btn:focus),
+  :global(.note-btn:active),
+  :global(.toggle:focus),
+  :global(.toggle:active),
+  :global([role="button"]:not(:disabled):focus),
+  :global([role="button"]:not(:disabled):active) {
+    box-shadow: 0 0 6px rgba(255, 182, 193, 0.6);
+    outline: none;
+  }
+
   .app {
     display: grid;
     grid-template-columns: auto 1fr;
@@ -298,21 +368,64 @@ const tabTitles = tabs.map((tab) => tab.title);
     width: 100vw;
     height: 100vh;
     overflow: hidden;
+    position: relative;
     background: var(--bg);
   }
 
-  main { display: flex; flex-direction: column; min-width: 0; }
+  .app::before {
+    content: '';
+    position: absolute;
+    inset: -10%; /* Extend beyond edges to allow movement */
+    background-image: url('/sakurabg.png');
+    background-size: 120%; /* Larger than container to allow parallax movement */
+    background-position: center;
+    background-repeat: no-repeat;
+    filter: brightness(0.4);
+    z-index: 0;
+    /* Parallax effect based on mouse position (inverted) */
+    transform: translate(
+      calc((0.5 - var(--mouse-x, 0.5)) * 20px),
+      calc((0.5 - var(--mouse-y, 0.5)) * 20px)
+    );
+    transition: transform 0.1s ease-out;
+    will-change: transform;
+  }
+
+  .app::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(ellipse at center, transparent 0%, rgba(0, 0, 0, 0.6) 100%);
+    z-index: 1;
+    pointer-events: none;
+  }
+
+  /* Falling sakura petals */
+  :global(.sakura-petal) {
+    position: fixed;
+    top: -20px;
+    width: 10px;
+    height: 10px;
+    background-color: rgba(255, 182, 193, 0.9);
+    border-radius: 50%;
+    pointer-events: none;
+    z-index: 1; /* Above background/vignette (0-1), below content (2) */
+    opacity: 0.6; /* Default opacity, dynamically adjusted by JS */
+    transition: opacity 0.2s ease;
+  }
+
+  main { display: flex; flex-direction: column; min-width: 0; position: relative; z-index: 2; }
   header {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 14px 18px; border-bottom: 1px solid var(--border); background: var(--bg-elev);
+    padding: 14px 18px; border-bottom: 1px solid var(--border); 
+    background: rgba(26, 26, 26, 0.85);
+    backdrop-filter: blur(8px);
   }
   header h1 { margin: 0; font-size: 15px; font-weight: 600; color: var(--fg); }
 
   .content { flex: 1; overflow: hidden; padding: 16px; position: relative; }
-
   .tab { display: none; height: 100%; overflow: auto; }
   .tab.active { display: block; }
-
   .placeholder {
     margin-top: 16px;
     padding: 16px;
@@ -325,5 +438,106 @@ const tabTitles = tabs.map((tab) => tab.title);
   @media (max-width: 900px) {
     .app { grid-template-columns: auto 1fr; }
   }
-</style>
 
+  /* Loading overlay */
+  .loading-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(18, 18, 18, 0.95);
+    backdrop-filter: blur(8px);
+    z-index: 10000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: all;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  .loading-content {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 24px;
+  }
+
+  .loading-spinner {
+    width: 48px;
+    height: 48px;
+    border: 3px solid rgba(255, 182, 193, 0.2);
+    border-top-color: #ffb6c1;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
+  .loading-text {
+    color: var(--fg);
+    font-size: 14px;
+    font-weight: 500;
+    text-align: center;
+  }
+
+  /* Welcome overlay */
+  .welcome-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(26, 26, 26, 0.85);
+    backdrop-filter: blur(8px);
+    z-index: 9999;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: all;
+    user-select: none;
+    -webkit-user-select: none;
+    opacity: 1;
+    transition: opacity 2s ease-out;
+  }
+
+  .welcome-overlay.fading {
+    opacity: 0;
+  }
+
+  .welcome-content {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 24px;
+  }
+
+  .welcome-icon {
+    width: 256px;
+    height: 256px;
+    object-fit: contain;
+    animation: welcome-fade-in 0.5s ease-out;
+  }
+
+  .welcome-text {
+    color: var(--fg);
+    font-size: 28px;
+    font-weight: 600;
+    text-align: center;
+    animation: welcome-fade-in 0.5s ease-out 0.2s both;
+  }
+
+  @keyframes welcome-fade-in {
+    from {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+</style>
