@@ -192,8 +192,9 @@ pub fn add_ban_log(admin: String, target: String, reason: String, timestamp: Str
     let admin_clone = admin.clone();
     let target_clone = target.clone();
     let reason_clone = reason.clone();
+    let action_type_clone = action_type.clone();
     async_runtime::spawn(async move {
-        if let Err(e) = send_log_to_api(admin_clone, target_clone, reason_clone).await {
+        if let Err(e) = send_log_to_api(admin_clone, target_clone, reason_clone, action_type_clone).await {
             crate::debug_eprintln!("[world_mod_logs] Failed to export log to API: {}", e);
         }
     });
@@ -283,20 +284,32 @@ pub fn search_ban_logs(query: &str) -> Result<Vec<BanLogEntry>, String> {
     Ok(entries)
 }
 
-/// Send a moderation log entry to the API endpoint
+/// Send a moderation log entry to the API endpoint.
 /// This is called asynchronously after a successful database insertion
-async fn send_log_to_api(admin: String, target: String, reason: String) -> Result<(), String> {
+async fn send_log_to_api(admin: String, target: String, reason: String, action_type: String) -> Result<(), String> {
+    // Get all stored tokens (similar to watchlist checks)
+    let tokens = crate::modules::group_auth::group_access_tokens::list_group_access_tokens()
+        .map_err(|e| format!("Failed to get tokens: {}", e))?;
+    
+    let access_tokens: Vec<String> = tokens
+        .into_iter()
+        .map(|t| t.access_token)
+        .filter(|t| t.len() >= 32) // Basic validation
+        .collect();
+    
     // API base URL - should match frontend and other modules
     let api_base = std::env::var("VITE_API_BASE")
         .unwrap_or_else(|_| "https://fch-toolkit.com".to_string());
     
     let url = format!("{}/api/worldlogs", api_base);
     
-    // Prepare JSON payload
+    // Prepare JSON payload with tokens and action_type (similar to check-user endpoint)
     let payload = serde_json::json!({
         "admin": admin,
         "target": target,
-        "reason": reason
+        "reason": reason,
+        "action_type": action_type,
+        "tokens": access_tokens
     });
     
     // Send HTTP POST request
