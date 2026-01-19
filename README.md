@@ -1,6 +1,10 @@
 # The FCH-Toolkit App
 The **standalone** solution for moderation assistance, with optional integration with [https://fch-toolkit.com]
 
+## YOU MUST ENABLE "FULL" DEBUG LOGS IN VRCHAT SETTINGS.
+## YOU MUST ENABLE "FULL" DEBUG LOGS IN VRCHAT SETTINGS.
+## YOU MUST ENABLE "FULL" DEBUG LOGS IN VRCHAT SETTINGS.
+
 Simply navigate to Releases and download the latest EXE.
 Virustotal scans always included with each installer!
 
