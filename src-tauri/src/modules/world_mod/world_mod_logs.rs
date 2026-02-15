@@ -18,6 +18,7 @@ pub struct BanLogEntry {
     pub reason: String,
     pub timestamp: String,
     pub action_type: String, // "ban" or "warn"
+    pub location: String,    // "world_id:instance_id" or "N/A"
 }
 
 /// Get the directory where the database is stored
@@ -69,6 +70,12 @@ fn get_connection() -> SqlResult<Connection> {
         "ALTER TABLE ban_logs ADD COLUMN action_type TEXT DEFAULT 'ban'",
         [],
     ).ok(); // Ignore error if column already exists
+
+    // Add location column (world_id:instance_id) if it doesn't exist
+    conn.execute(
+        "ALTER TABLE ban_logs ADD COLUMN location TEXT DEFAULT 'N/A'",
+        [],
+    ).ok(); // Ignore error if column already exists
     
     // Create index on timestamp for faster chronological queries
     conn.execute(
@@ -99,7 +106,8 @@ pub fn init_db() -> Result<(), String> {
 /// Returns the row ID if inserted, or the existing ID if a duplicate timestamp already exists
 /// timestamp: The timestamp extracted from the log line (format: YYYY.MM.DD HH:MM:SS)
 /// action_type: "ban" or "warn"
-pub fn add_ban_log(admin: String, target: String, reason: String, timestamp: String, action_type: String) -> Result<i64, String> {
+/// location: "world_id:instance_id" or "N/A" (current instance when event occurred)
+pub fn add_ban_log(admin: String, target: String, reason: String, timestamp: String, action_type: String, location: String) -> Result<i64, String> {
     let start_time = std::time::Instant::now();
     crate::debug_println!("[PERF] add_ban_log START (action: {}, admin: {}, target: {})", action_type, admin, target);
     
@@ -178,9 +186,10 @@ pub fn add_ban_log(admin: String, target: String, reason: String, timestamp: Str
     
     // Insert new entry
     let insert_start = std::time::Instant::now();
+    let loc = if location.is_empty() { "N/A" } else { location.as_str() };
     conn.execute(
-        "INSERT INTO ban_logs (admin, target, reason, timestamp, action_type) VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![admin.clone(), target.clone(), reason.clone(), timestamp, action_type],
+        "INSERT INTO ban_logs (admin, target, reason, timestamp, action_type, location) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![admin.clone(), target.clone(), reason.clone(), timestamp, action_type, loc],
     )
     .map_err(|e| e.to_string())?;
     let insert_duration = insert_start.elapsed();
@@ -193,8 +202,9 @@ pub fn add_ban_log(admin: String, target: String, reason: String, timestamp: Str
     let target_clone = target.clone();
     let reason_clone = reason.clone();
     let action_type_clone = action_type.clone();
+    let location_clone = location.clone();
     async_runtime::spawn(async move {
-        if let Err(e) = send_log_to_api(admin_clone, target_clone, reason_clone, action_type_clone).await {
+        if let Err(e) = send_log_to_api(admin_clone, target_clone, reason_clone, action_type_clone, location_clone).await {
             crate::debug_eprintln!("[world_mod_logs] Failed to export log to API: {}", e);
         }
     });
@@ -216,7 +226,7 @@ pub fn get_all_ban_logs() -> Result<Vec<BanLogEntry>, String> {
     
     let query_start = std::time::Instant::now();
     let mut stmt = conn
-        .prepare("SELECT id, admin, target, reason, timestamp, action_type FROM ban_logs ORDER BY timestamp DESC")
+        .prepare("SELECT id, admin, target, reason, timestamp, action_type, COALESCE(location, 'N/A') FROM ban_logs ORDER BY timestamp DESC")
         .map_err(|e| e.to_string())?;
     
     let entries = stmt
@@ -228,6 +238,7 @@ pub fn get_all_ban_logs() -> Result<Vec<BanLogEntry>, String> {
                 reason: row.get(3)?,
                 timestamp: row.get(4)?,
                 action_type: row.get(5).unwrap_or_else(|_| "ban".to_string()),
+                location: row.get(6).unwrap_or_else(|_| "N/A".to_string()),
             })
         })
         .map_err(|e| e.to_string())?
@@ -256,7 +267,7 @@ pub fn search_ban_logs(query: &str) -> Result<Vec<BanLogEntry>, String> {
     let query_start = std::time::Instant::now();
     let mut stmt = conn
         .prepare(
-            "SELECT id, admin, target, reason, timestamp, action_type FROM ban_logs 
+            "SELECT id, admin, target, reason, timestamp, action_type, COALESCE(location, 'N/A') FROM ban_logs 
              WHERE admin LIKE ?1 OR target LIKE ?1 
              ORDER BY timestamp DESC"
         )
@@ -271,6 +282,7 @@ pub fn search_ban_logs(query: &str) -> Result<Vec<BanLogEntry>, String> {
                 reason: row.get(3)?,
                 timestamp: row.get(4)?,
                 action_type: row.get(5).unwrap_or_else(|_| "ban".to_string()),
+                location: row.get(6).unwrap_or_else(|_| "N/A".to_string()),
             })
         })
         .map_err(|e| e.to_string())?
@@ -286,7 +298,7 @@ pub fn search_ban_logs(query: &str) -> Result<Vec<BanLogEntry>, String> {
 
 /// Send a moderation log entry to the API endpoint.
 /// This is called asynchronously after a successful database insertion
-async fn send_log_to_api(admin: String, target: String, reason: String, action_type: String) -> Result<(), String> {
+async fn send_log_to_api(admin: String, target: String, reason: String, action_type: String, location: String) -> Result<(), String> {
     // Get all stored tokens (similar to watchlist checks)
     let tokens = crate::modules::group_auth::group_access_tokens::list_group_access_tokens()
         .map_err(|e| format!("Failed to get tokens: {}", e))?;
@@ -303,12 +315,13 @@ async fn send_log_to_api(admin: String, target: String, reason: String, action_t
     
     let url = format!("{}/api/worldlogs", api_base);
     
-    // Prepare JSON payload with tokens and action_type (similar to check-user endpoint)
+    // Prepare JSON payload with tokens, action_type, and location (world_id:instance_id)
     let payload = serde_json::json!({
         "admin": admin,
         "target": target,
         "reason": reason,
         "action_type": action_type,
+        "location": location,
         "tokens": access_tokens
     });
     
@@ -336,7 +349,7 @@ pub fn add_ban_log_entry(admin: String, target: String, reason: String, timestam
     // If timestamp not provided, use current time (for manual entries)
     let ts = timestamp.unwrap_or_else(|| chrono::Local::now().format("%Y.%m.%d %H:%M:%S").to_string());
     let action = action_type.unwrap_or_else(|| "ban".to_string());
-    add_ban_log(admin, target, reason, ts, action)
+    add_ban_log(admin, target, reason, ts, action, "N/A".to_string())
 }
 
 #[tauri::command]

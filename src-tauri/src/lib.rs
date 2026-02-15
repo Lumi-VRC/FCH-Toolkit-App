@@ -27,7 +27,7 @@ macro_rules! debug_println {
 #[cfg(debug_assertions)]
 macro_rules! debug_eprintln {
     ($($arg:tt)*) => {
-        crate::debug_eprintln!($($arg)*);
+        eprintln!($($arg)*);
     };
 }
 
@@ -57,7 +57,10 @@ pub fn run() {
                 crate::modules::log_reader::log_reader::stop_log_reader,
                 crate::modules::log_reader::log_reader::get_most_recent_log_file,
                 crate::modules::log_reader::log_reader::open_most_recent_log_file,
+                crate::modules::log_reader::log_reader::open_most_recent_log_folder,
                 crate::modules::log_reader::log_parser::manual_refresh_scan,
+                crate::modules::log_reader::log_parser::get_current_location,
+                crate::modules::log_reader::log_parser::get_instance_history,
                 crate::modules::local_db::localdb::add_note,
                 crate::modules::local_db::localdb::get_note,
                 crate::modules::local_db::localdb::get_all_notes,

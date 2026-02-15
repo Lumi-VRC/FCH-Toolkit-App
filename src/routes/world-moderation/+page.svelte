@@ -10,6 +10,7 @@
     reason: string;
     timestamp: string;
     action_type: string; // "ban" or "warn"
+    location?: string;   // "world_id:instance_id" or "N/A"
   };
 
   let banLogs = $state<BanLogEntry[]>([]);
@@ -166,6 +167,10 @@
               <span class="reason-label">Reason:</span>
               <span class="reason-text">{entry.reason}</span>
             </div>
+            <div class="log-location">
+              <span class="location-label">Location:</span>
+              <span class="location-text">{entry.location ?? 'N/A'}</span>
+            </div>
           </div>
         {/each}
       </div>
@@ -317,6 +322,7 @@
   .log-reason {
     display: flex;
     gap: 8px;
+    align-items: center;
     padding: 12px;
     padding-top: 8px;
     border-top: 1px solid var(--border);
@@ -333,5 +339,28 @@
     color: var(--fg);
     font-size: 13px;
     flex: 1;
+  }
+
+  .log-location {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    padding: 12px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+  }
+
+  .location-label {
+    color: var(--fg-muted);
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
+  .location-text {
+    color: var(--fg);
+    font-size: 12px;
+    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+    word-break: break-all;
   }
 </style>

@@ -142,7 +142,7 @@
       <div class="empty">No debug entries match the current filters.</div>
     {:else}
       <ul>
-        {#each $filters as entry (entry.ts + entry.message)}
+        {#each $filters as entry, i (entry.ts + entry.message + entry.level + entry.source + i)}
           <li class="entry entry-{entry.level} entry-{entry.source}">
             <span class="timestamp">{new Date(entry.ts).toLocaleTimeString()}</span>
             <span class="level-badge level-{entry.level}">{entry.level}</span>

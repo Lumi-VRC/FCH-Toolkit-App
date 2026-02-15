@@ -196,6 +196,68 @@ pub fn open_most_recent_log_file() -> Result<String, String> {
     }
 }
 
+// Tauri command to open the log folder.
+// If no log file has been discovered yet, it opens the default VRChat log folder.
+#[tauri::command]
+pub fn open_most_recent_log_folder() -> Result<String, String> {
+    let reader_guard = LOG_READER.lock().map_err(|e| e.to_string())?;
+
+    let folder_path = if let Some(reader) = reader_guard.as_ref() {
+        reader.log_directory.clone()
+    } else {
+        default_vrchat_log_dir()
+    };
+
+    let path_str = folder_path.to_string_lossy().to_string();
+
+    if !folder_path.exists() {
+        return Err(format!("Log folder does not exist: {}", path_str));
+    }
+
+    // Open folder with system file explorer.
+    #[cfg(target_os = "windows")]
+    {
+        let result = std::process::Command::new("explorer.exe")
+            .arg(&path_str)
+            .spawn();
+
+        match result {
+            Ok(_) => Ok(format!("Opened folder: {}", path_str)),
+            Err(e) => {
+                crate::debug_eprintln!("Failed to open folder with explorer.exe: {}", e);
+                let fallback = std::process::Command::new("cmd")
+                    .args(["/C", "start", "", &path_str])
+                    .spawn();
+                match fallback {
+                    Ok(_) => Ok(format!("Opened folder (fallback): {}", path_str)),
+                    Err(e2) => Err(format!(
+                        "Failed to open folder: {} - Error: {} (fallback: {})",
+                        path_str, e, e2
+                    )),
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let result = std::process::Command::new("open").arg(&folder_path).spawn();
+        match result {
+            Ok(_) => Ok(format!("Opened folder: {}", path_str)),
+            Err(e) => Err(format!("Failed to open folder: {} - Error: {}", path_str, e)),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let result = std::process::Command::new("xdg-open").arg(&folder_path).spawn();
+        match result {
+            Ok(_) => Ok(format!("Opened folder: {}", path_str)),
+            Err(e) => Err(format!("Failed to open folder: {} - Error: {}", path_str, e)),
+        }
+    }
+}
+
 // Step 2: File Discovery - Find and track all output_log_*.txt files
 fn update_logs(
     log_dir: &PathBuf,

@@ -7,6 +7,7 @@ use lazy_static::lazy_static;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{SystemTime, Duration};
 
 // Get VRChat log directory (Windows: %LOCALAPPDATA%\..\LocalLow\VRChat\VRChat)
@@ -43,6 +44,112 @@ lazy_static! {
     static ref TIMESTAMP_REGEX: Regex = Regex::new(
         r"(?:^|\]\s+)(\d{4}\.\d{2}\.\d{2}\s+\d{2}:\d{2}:\d{2})"
     ).expect("Failed to compile timestamp regex");
+
+    // [Behaviour] Joining wrld_xxx:57420~private(...)~region(us) - extract world id and instance id (discard after first ~)
+    // Must match wrld_ to avoid incorrectly matching "Joining or Creating Room: X"
+    static ref JOINING_WORLD_REGEX: Regex = Regex::new(
+        r"\[Behaviour\]\s+Joining\s+(wrld_[^:]+):([^~]+)"
+    ).expect("Failed to compile joining world regex");
+
+    // [Behaviour] Joining or Creating Room: Furry Hideout
+    static ref JOINING_ROOM_REGEX: Regex = Regex::new(
+        r"\[Behaviour\]\s+Joining\s+or\s+Creating\s+Room:\s*(.+)"
+    ).expect("Failed to compile joining room regex");
+}
+
+/// In-memory location state (world id, instance id, room name) - latest only, overwritten by new discoveries
+#[derive(Default)]
+struct LocationState {
+    world_id: Option<String>,
+    instance_id: Option<String>,
+    room_name: Option<String>,
+    /// Timestamp when we joined this instance (from Joining line). Used to discard moderation events within 15s.
+    instance_joined_timestamp: Option<String>,
+}
+
+/// Instance history entry (join/leave) - in-memory, cleared on restart
+#[derive(Clone, serde::Serialize)]
+struct InstanceHistoryEntry {
+    timestamp: String,
+    kind: String, // "join" | "leave"
+    world_id: Option<String>,
+    instance_id: Option<String>,
+    room_name: Option<String>,
+}
+
+const INSTANCE_HISTORY_MAX: usize = 200;
+
+lazy_static! {
+    static ref LOCATION_STATE: Mutex<LocationState> = Mutex::new(LocationState::default());
+    static ref INSTANCE_HISTORY: Mutex<Vec<InstanceHistoryEntry>> = Mutex::new(Vec::new());
+}
+
+fn extract_timestamp_from_line(line: &str) -> String {
+    TIMESTAMP_REGEX
+        .captures(line)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| chrono::Local::now().format("%Y.%m.%d %H:%M:%S").to_string())
+}
+
+fn push_instance_history_join(line: &str, world_id: Option<String>, instance_id: Option<String>, room_name: Option<String>) {
+    if let Ok(mut hist) = INSTANCE_HISTORY.lock() {
+        let timestamp = extract_timestamp_from_line(line);
+        hist.push(InstanceHistoryEntry {
+            timestamp,
+            kind: "join".to_string(),
+            world_id,
+            instance_id,
+            room_name,
+        });
+        let len = hist.len();
+        if len > INSTANCE_HISTORY_MAX {
+            hist.drain(0..(len - INSTANCE_HISTORY_MAX));
+        }
+    }
+}
+
+fn push_instance_history_leave(line: &str) {
+    if let Ok(mut hist) = INSTANCE_HISTORY.lock() {
+        let timestamp = extract_timestamp_from_line(line);
+        hist.push(InstanceHistoryEntry {
+            timestamp,
+            kind: "leave".to_string(),
+            world_id: None,
+            instance_id: None,
+            room_name: None,
+        });
+        let len = hist.len();
+        if len > INSTANCE_HISTORY_MAX {
+            hist.drain(0..(len - INSTANCE_HISTORY_MAX));
+        }
+    }
+}
+
+fn update_last_history_room(room_name: Option<String>) {
+    if let (Ok(mut hist), Some(room)) = (INSTANCE_HISTORY.lock(), room_name) {
+        if let Some(last) = hist.last_mut() {
+            if last.kind == "join" && last.room_name.is_none() {
+                last.room_name = Some(room);
+            }
+        }
+    }
+}
+
+/// Get instance history (for stopwatch modal)
+#[tauri::command]
+pub fn get_instance_history() -> Result<Vec<serde_json::Value>, String> {
+    if let Ok(hist) = INSTANCE_HISTORY.lock() {
+        Ok(hist.iter().rev().map(|e| serde_json::json!({
+            "timestamp": e.timestamp,
+            "kind": e.kind,
+            "world_id": e.world_id,
+            "instance_id": e.instance_id,
+            "room_name": e.room_name
+        })).collect())
+    } else {
+        Err("Failed to get instance history".to_string())
+    }
 }
 
 /// Parse player join/leave events from log lines
@@ -79,6 +186,9 @@ fn parse_player_join_leave(app_handle: &tauri::AppHandle, line: &str, file_name:
     false
 }
 
+/// Minimum seconds in instance before recording moderation events (discard earlier)
+const MOD_LOG_MIN_SECONDS_IN_INSTANCE: i64 = 30;
+
 /// Parse ban/warn events from log lines
 /// Returns true if a moderation event was found and stored
 fn parse_ban_event(app_handle: &tauri::AppHandle, line: &str, _file_name: &str) -> bool {
@@ -103,14 +213,37 @@ fn parse_ban_event(app_handle: &tauri::AppHandle, line: &str, _file_name: &str) 
             .map(|m| m.as_str().to_string())
             .unwrap_or_else(|| chrono::Local::now().format("%Y.%m.%d %H:%M:%S").to_string());
         
+        // Discard events within 15 seconds of joining the instance (avoids carryover/stale events)
+        if let Ok(state) = LOCATION_STATE.lock() {
+            if let Some(ref join_ts) = state.instance_joined_timestamp {
+                let join_dt = chrono::NaiveDateTime::parse_from_str(join_ts, "%Y.%m.%d %H:%M:%S");
+                let ban_dt = chrono::NaiveDateTime::parse_from_str(&timestamp, "%Y.%m.%d %H:%M:%S");
+                if let (Ok(join), Ok(ban)) = (join_dt, ban_dt) {
+                    let elapsed = ban.signed_duration_since(join);
+                    if elapsed >= chrono::Duration::zero()
+                        && elapsed < chrono::Duration::seconds(MOD_LOG_MIN_SECONDS_IN_INSTANCE)
+                    {
+                        crate::debug_println!(
+                            "[MOD_LOG] Discarding {} event (within {}s of instance join)",
+                            action_normalized,
+                            MOD_LOG_MIN_SECONDS_IN_INSTANCE
+                        );
+                        return false; // Don't record or emit
+                    }
+                }
+            }
+        }
+        
         // Store moderation log entry in database with extracted timestamp
         let db_start = std::time::Instant::now();
+        let location = get_current_location_for_mod_log();
         if let Err(e) = crate::modules::world_mod::world_mod_logs::add_ban_log(
             admin.clone(),
             target.clone(),
             reason.clone(),
             timestamp.clone(),
             action_normalized.clone(),
+            location,
         ) {
             crate::debug_eprintln!("Failed to store moderation log: {}", e);
         }
@@ -136,17 +269,121 @@ fn parse_ban_event(app_handle: &tauri::AppHandle, line: &str, _file_name: &str) 
     false
 }
 
+/// Clear location state (e.g. when instance is cleared)
+fn clear_location_state() {
+    if let Ok(mut state) = LOCATION_STATE.lock() {
+        *state = LocationState::default();
+    }
+}
+
+/// Get current location as "world_id:instance_id" for enrichment when recording moderation events.
+/// Returns "N/A" if no location or on error.
+pub fn get_current_location_for_mod_log() -> String {
+    if let Ok(state) = LOCATION_STATE.lock() {
+        match (&state.world_id, &state.instance_id) {
+            (Some(w), Some(i)) => format!("{}:{}", w, i),
+            (Some(w), None) => format!("{}:N/A", w),
+            (None, Some(i)) => format!("N/A:{}", i),
+            (None, None) => "N/A".to_string(),
+        }
+    } else {
+        "N/A".to_string()
+    }
+}
+
+/// Get current location (for frontend to request when tab becomes visible)
+#[tauri::command]
+pub fn get_current_location() -> Result<serde_json::Value, String> {
+    if let Ok(state) = LOCATION_STATE.lock() {
+        Ok(serde_json::json!({
+            "world_id": state.world_id,
+            "instance_id": state.instance_id,
+            "room_name": state.room_name
+        }))
+    } else {
+        Err("Failed to get location state".to_string())
+    }
+}
+
+/// Parse [Behaviour] Joining world:instance and [Behaviour] Joining or Creating Room lines.
+/// Updates in-memory state (latest only). If emit is true, emits location_update event.
+fn parse_location_update(app_handle: &tauri::AppHandle, line: &str, emit: bool) -> bool {
+    let mut updated = false;
+
+    // [Behaviour] Joining wrld_xxx:57420~...
+    if let Some(captures) = JOINING_WORLD_REGEX.captures(line) {
+        let world_id = captures.get(1).map(|m| m.as_str().trim().to_string()).filter(|s| !s.is_empty());
+        let instance_id = captures.get(2).map(|m| m.as_str().trim().to_string()).filter(|s| !s.is_empty());
+
+        if world_id.is_some() || instance_id.is_some() {
+            push_instance_history_join(line, world_id.clone(), instance_id.clone(), None);
+            if let Ok(mut state) = LOCATION_STATE.lock() {
+                if world_id.is_some() {
+                    state.world_id = world_id;
+                }
+                if instance_id.is_some() {
+                    state.instance_id = instance_id;
+                }
+                state.instance_joined_timestamp = Some(extract_timestamp_from_line(line));
+                updated = true;
+            }
+        }
+    }
+
+    // [Behaviour] Joining or Creating Room: Room Name
+    if let Some(captures) = JOINING_ROOM_REGEX.captures(line) {
+        let room_name = captures.get(1).map(|m| m.as_str().trim().to_string()).filter(|s| !s.is_empty());
+
+        if room_name.is_some() {
+            update_last_history_room(room_name.clone());
+            if let Ok(mut state) = LOCATION_STATE.lock() {
+                state.room_name = room_name;
+                updated = true;
+            }
+        }
+    }
+
+    if updated && emit {
+        if let Ok(state) = LOCATION_STATE.lock() {
+            let _ = app_handle.emit("location_update", serde_json::json!({
+                "world_id": state.world_id,
+                "instance_id": state.instance_id,
+                "room_name": state.room_name
+            }));
+        }
+    }
+
+    updated
+}
+
 pub fn emit_log_line(app_handle: &tauri::AppHandle, line: &str, file_name: &str) {
     // Check for "[Behaviour] Successfully joined room" or "[Behaviour] OnLeftRoom"
     // These indicate a new instance session or leaving the instance
     if line.contains("[Behaviour] Successfully joined room") || 
        line.contains("[Behaviour] OnLeftRoom") {
-        // Emit event to clear instance monitor
+        // Only clear location when leaving - "Successfully joined room" comes AFTER Joining lines,
+        // so clearing here would wipe the location we just parsed for the new instance
+        let left = line.contains("[Behaviour] OnLeftRoom");
+        if left {
+            push_instance_history_leave(line);
+            clear_location_state();
+            let _ = app_handle.emit("location_update", serde_json::json!({
+                "world_id": null,
+                "instance_id": null,
+                "room_name": null
+            }));
+        }
+        // Emit event to clear instance monitor (clears player list)
+        // left: true when OnLeftRoom so frontend can clear location/timer; false when Successfully joined room
         let _ = app_handle.emit("instance_cleared", serde_json::json!({
             "file": file_name,
-            "timestamp": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+            "timestamp": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            "left": left
         }));
     }
+
+    // Parse location lines ([Behaviour] Joining world:instance, Joining or Creating Room)
+    parse_location_update(app_handle, line, true);
     
     // Check for ban events
     parse_ban_event(app_handle, line, file_name);
@@ -268,7 +505,7 @@ pub fn manual_refresh_scan(app_handle: tauri::AppHandle) -> Result<String, Strin
         .unwrap_or("unknown")
         .to_string();
     
-    // Read file from bottom up until "[Behaviour] Successfully joined room" or top
+    // Read file from bottom up until "[Behaviour] Joining wrld_xxx:instance" (earliest of the three; always occurs first)
     let open_start = std::time::Instant::now();
     let mut file = File::open(&log_file_path)
         .map_err(|e| format!("Failed to open log file: {}", e))?;
@@ -285,10 +522,10 @@ pub fn manual_refresh_scan(app_handle: tauri::AppHandle) -> Result<String, Strin
     const CHUNK_SIZE: u64 = 8192; // 8KB chunks
     let mut buffer = Vec::new();
     let mut position = file_size;
-    let mut found_joined_room = false;
+    let mut found_joining = false;
     
     // Read backwards in chunks
-    while position > 0 && !found_joined_room {
+    while position > 0 && !found_joining {
         let chunk_start = if position > CHUNK_SIZE {
             position - CHUNK_SIZE
         } else {
@@ -311,7 +548,7 @@ pub fn manual_refresh_scan(app_handle: tauri::AppHandle) -> Result<String, Strin
         // Prepend chunk to buffer (only the bytes we actually read)
         buffer.splice(0..0, chunk[..bytes_read].iter().cloned());
         
-        // Check for "[Behaviour] Successfully joined room" in the buffer
+        // Check for "[Behaviour] Joining wrld_xxx:instance" in the buffer (earliest of the three; occurs first)
         let buffer_str = match String::from_utf8(buffer.clone()) {
             Ok(s) => s,
             Err(_) => {
@@ -320,24 +557,24 @@ pub fn manual_refresh_scan(app_handle: tauri::AppHandle) -> Result<String, Strin
             }
         };
         
-        if buffer_str.contains("[Behaviour] Successfully joined room") {
-            found_joined_room = true;
-            // Emit event to clear instance monitor when we find a new room join
+        if buffer_str.contains("Joining wrld_") {
+            found_joining = true;
+
+            // Find the last occurrence and keep from the start of that line (includes Joining, Joining or Creating Room, Successfully joined room, player events)
+            if let Some(last_pos) = buffer_str.rfind("Joining wrld_") {
+                // Find the start of the line containing the marker (previous newline or start of buffer)
+                let line_start = buffer_str[..last_pos].rfind('\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                let remaining_str = &buffer_str[line_start..];
+                buffer = remaining_str.as_bytes().to_vec();
+            }
+
+            // Emit event to clear instance monitor before we push new data
             let _ = app_handle.emit("instance_cleared", serde_json::json!({
                 "file": file_name,
                 "timestamp": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
             }));
-            
-            // Find the last occurrence and only process lines after it
-            if let Some(last_pos) = buffer_str.rfind("[Behaviour] Successfully joined room") {
-                // Find the end of the line containing the marker (next newline or end)
-                let line_end = buffer_str[last_pos..].find('\n')
-                    .map(|i| last_pos + i + 1)
-                    .unwrap_or(buffer_str.len());
-                // Keep only the part after the marker line
-                let remaining_str = &buffer_str[line_end..];
-                buffer = remaining_str.as_bytes().to_vec();
-            }
         }
         
         position = chunk_start;
@@ -350,7 +587,24 @@ pub fn manual_refresh_scan(app_handle: tauri::AppHandle) -> Result<String, Strin
     let all_lines: Vec<&str> = content.lines().collect();
     let parse_duration = parse_start.elapsed();
     crate::debug_println!("[PERF] manual_refresh_scan parsed {} lines: {:.2}ms", all_lines.len(), parse_duration.as_secs_f64() * 1000.0);
-    
+
+    // Parse location from lines (forward order so last match wins - most recent state)
+    clear_location_state();
+    for line in all_lines.iter() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            parse_location_update(&app_handle, trimmed, false);
+        }
+    }
+    // Emit location_update once with final state
+    if let Ok(state) = LOCATION_STATE.lock() {
+        let _ = app_handle.emit("location_update", serde_json::json!({
+            "world_id": state.world_id,
+            "instance_id": state.instance_id,
+            "room_name": state.room_name
+        }));
+    }
+
     // Cache all player events during scan (don't emit yet)
     let mut cached_events: Vec<CachedPlayerEvent> = Vec::new();
     let mut join_count = 0;

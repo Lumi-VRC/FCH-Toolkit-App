@@ -176,7 +176,7 @@
               <span class="volume-value">{Math.round(groupNotificationVolume * 100)}%</span>
             </div>
           </div>
-        </div>
+  </div>
       </div>
 
       <!-- Local Notifications Panel -->

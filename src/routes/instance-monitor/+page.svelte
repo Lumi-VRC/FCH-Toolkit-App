@@ -15,6 +15,11 @@
   let isInitializing = $state(false);
   let hasInitialized = $state(false);
   
+  // Event queue for sequential processing (prevents race conditions)
+  // Using closure variables (not reactive) since queue is internal implementation detail
+  let eventQueue = [];
+  let isProcessingQueue = false;
+  
   // Batch note lookups to avoid repeated get_all_notes calls
   let pendingNoteLookups = $state(new Set());
   let noteBatchTimer = null;
@@ -27,8 +32,31 @@
   let groupAggregates = $state(new Map());
   // Modal state for showing group data
   let showGroupModal = $state(null);
+
+  // Current location (from [Behaviour] Joining / Joining or Creating Room log lines)
+  let location = $state({ roomName: null, worldId: null, instanceId: null });
+
+  // Time-in-instance: when we entered the current instance (ms since epoch), null if not in one
+  let instanceJoinedAt = $state(null);
+  let timeInInstanceDisplay = $state('0:00');
+  let timeInInstanceInterval = null;
+
+  // Instance history modal (stopwatch)
+  let showHistoryModal = $state(false);
+  let instanceHistory = $state([]);
   
   const API_BASE = ((import.meta as any)?.env?.VITE_API_BASE || 'https://fch-toolkit.com');
+
+  // Format elapsed seconds as m:ss or h mm:ss
+  function formatElapsed(sec) {
+    if (sec < 0 || !Number.isFinite(sec)) return '0:00';
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = Math.floor(sec % 60);
+    if (h > 0) return `${h}h ${m}m`;
+    if (m > 0) return `${m}:${s.toString().padStart(2, '0')}`;
+    return `0:${s.toString().padStart(2, '0')}`;
+  }
 
   // Safely get first grapheme for avatar initial (handles emojis/combining marks)
   function firstGrapheme(s) {
@@ -69,8 +97,24 @@
   }
 
   // Get sorted active users (group watchlist first, then local watchlist, then others)
+  // Includes safety deduplication to prevent duplicate key errors
   function getSortedActiveUsers() {
-    return [...activeUsers].sort((a, b) => {
+    // Safety: Deduplicate by userId (keep first occurrence)
+    const seen = new Set();
+    const unique = activeUsers.filter(user => {
+      if (seen.has(user.userId)) {
+        return false; // Skip duplicate
+      }
+      seen.add(user.userId);
+      return true;
+    });
+    
+    // If duplicates were found, log a warning (helps diagnose the root cause)
+    if (unique.length !== activeUsers.length) {
+      console.warn(`[DUPLICATE DETECTED] Found ${activeUsers.length - unique.length} duplicate(s) in activeUsers. This should not happen with the queue system.`);
+    }
+    
+    return unique.sort((a, b) => {
       const aHasGroup = hasGroupWatchlist(a.userId);
       const bHasGroup = hasGroupWatchlist(b.userId);
       const aHasLocal = watch.get(a.userId) || false;
@@ -232,12 +276,46 @@
     console.log(`[PERF] refreshAllUserStatus END: ${totalDuration.toFixed(2)}ms`);
   }
 
-  function handlePlayerEvent(event) {
+  // Enqueue event for sequential processing
+  function enqueuePlayerEvent(event) {
     const payload = event.payload;
     if (!payload || typeof payload !== 'object') return;
-
-    const p = payload;
-
+    
+    eventQueue.push(payload);
+    processEventQueue();
+  }
+  
+  // Process events sequentially (one at a time) to prevent race conditions
+  async function processEventQueue() {
+    // If already processing, just return (events will be processed by the active processor)
+    if (isProcessingQueue) {
+      return;
+    }
+    
+    // Set flag immediately to prevent concurrent processing
+    isProcessingQueue = true;
+    
+    try {
+      // Process all queued events sequentially
+      while (eventQueue.length > 0) {
+        const p = eventQueue.shift(); // Remove and get first event
+        // Process synchronously - state updates are synchronous
+        processPlayerEvent(p);
+      }
+    } finally {
+      // Always reset flag, even if an error occurs
+      isProcessingQueue = false;
+      
+      // If more events arrived while processing, process them now
+      if (eventQueue.length > 0) {
+        // Use setTimeout to avoid stack overflow and allow UI to update
+        setTimeout(() => processEventQueue(), 0);
+      }
+    }
+  }
+  
+  // Process a single player event (synchronous state updates)
+  function processPlayerEvent(p) {
     // Check if log file changed - if so, purge all users
     if (p.file && p.file !== currentLogFile) {
       if (currentLogFile !== null) {
@@ -257,23 +335,31 @@
       const username = p.username || 'Unknown';
       const timestamp = p.timestamp || '';
 
-      // Check if user already exists
-      const exists = activeUsers.some(u => u.userId === userId);
-      if (!exists) {
-        activeUsers = [...activeUsers, {
+      // Check if user already exists (for logging/debugging)
+      const existingCount = activeUsers.filter(u => u.userId === userId).length;
+      if (existingCount > 0) {
+        console.warn(`[DUPLICATE EVENT] Received player_joined for ${userId} (${username}), but ${existingCount} entry/entries already exist. This suggests duplicate events from backend.`);
+      }
+
+      // Atomic: filter out any existing entry first, then add
+      // This ensures only one entry per userId even if duplicates arrive
+      activeUsers = [
+        ...activeUsers.filter(u => u.userId !== userId),
+        {
           userId,
           username,
           joinedAt: timestamp
-        }];
-        // Add user to batch for group watchlist check
-        invoke('add_user_to_batch_command', { userId }).catch((err) => {
-          console.error('Failed to add user to batch:', err);
-        });
-        // Only load watch/note status if not initializing (during retroactive scan)
-        // During initialization, refreshAllUserStatus will bulk-load all statuses
-        if (!isInitializing) {
-          scheduleNoteLookup(userId);
         }
+      ];
+      
+      // Add user to batch for group watchlist check
+      invoke('add_user_to_batch_command', { userId }).catch((err) => {
+        console.error('Failed to add user to batch:', err);
+      });
+      // Only load watch/note status if not initializing (during retroactive scan)
+      // During initialization, refreshAllUserStatus will bulk-load all statuses
+      if (!isInitializing) {
+        scheduleNoteLookup(userId);
       }
     } else if (p.event === 'player_left') {
       // Remove user from active list
@@ -282,6 +368,11 @@
       // Note: We keep watch/note status in memory even after they leave
       // so it's available if they rejoin
     }
+  }
+  
+  // Legacy handler (now just enqueues)
+  function handlePlayerEvent(event) {
+    enqueuePlayerEvent(event);
   }
 
   onMount(async () => {
@@ -294,10 +385,23 @@
       // Listen for player events
       const playerUnlisten = await listen('player_event', handlePlayerEvent);
       
-      // Listen for instance cleared events (when successfully joined room is detected)
-      const clearUnlisten = await listen('instance_cleared', () => {
-        // Clear all users when a new room is successfully joined
+      // Listen for instance cleared events (when successfully joined room or OnLeftRoom)
+      const clearUnlisten = await listen('instance_cleared', async (e) => {
+        const payload = (e?.payload || {}) as any;
+        const left = payload?.left === true; // true when OnLeftRoom, false when Successfully joined room
+        
+        // Wait for any pending events to finish processing before clearing
+        // This ensures instance_cleared happens after all queued player events
+        while (isProcessingQueue || eventQueue.length > 0) {
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+        
         activeUsers = [];
+        // Only clear timer/location when we actually left; keep them when Successfully joined room (new instance)
+        if (left) {
+          instanceJoinedAt = null;
+          location = { roomName: null, worldId: null, instanceId: null };
+        }
         watch.clear();
         noted.clear();
         groupMatches.clear();
@@ -306,6 +410,23 @@
         noted = new Map(noted);
         groupMatches = new Map(groupMatches);
         groupAggregates = new Map(groupAggregates);
+      });
+
+      // Listen for location updates ([Behaviour] Joining world:instance, Joining or Creating Room)
+      const locationUnlisten = await listen('location_update', (e) => {
+        const payload = (e?.payload || {}) as any;
+        if (!payload || typeof payload !== 'object') return;
+        location = {
+          roomName: payload.room_name ?? payload.roomName ?? null,
+          worldId: payload.world_id ?? payload.worldId ?? null,
+          instanceId: payload.instance_id ?? payload.instanceId ?? null
+        };
+        // Start time-in-instance timer when we have a valid location
+        if (location.roomName || location.worldId || location.instanceId) {
+          instanceJoinedAt = Date.now();
+        } else {
+          instanceJoinedAt = null;
+        }
       });
       
       // Listen for group watchlist results
@@ -383,6 +504,7 @@
       unlisten = () => {
         playerUnlisten();
         clearUnlisten();
+        locationUnlisten();
         groupWatchUnlisten();
       };
       const listenerSetupDuration = performance.now() - listenerSetupStart;
@@ -416,9 +538,24 @@
         hasInitialized = true;
         isInitializing = false;
         
-        loadingMessage.set('Ready');
+          loadingMessage.set('Ready');
         await new Promise(resolve => setTimeout(resolve, 300)); // Brief delay for smooth transition
-        
+
+        // Fallback: fetch current location in case location_update was missed
+        try {
+          const loc = await invoke('get_current_location') as any;
+          if (loc && typeof loc === 'object') {
+            location = {
+              roomName: loc.room_name ?? loc.roomName ?? null,
+              worldId: loc.world_id ?? loc.worldId ?? null,
+              instanceId: loc.instance_id ?? loc.instanceId ?? null
+            };
+            if (location.roomName || location.worldId || location.instanceId) {
+              instanceJoinedAt = Date.now();
+            }
+          }
+        } catch (_) { /* ignore */ }
+
         // Only dismiss if we're still the one controlling the loading state
         const stillLoading = get(isLoading);
         if (stillLoading) {
@@ -450,9 +587,38 @@
     }
   });
 
+  // Time-in-instance: run a 1s ticker when we're in an instance
+  $effect(() => {
+    const joined = instanceJoinedAt;
+    if (joined == null) {
+      if (timeInInstanceInterval) {
+        clearInterval(timeInInstanceInterval);
+        timeInInstanceInterval = null;
+      }
+      timeInInstanceDisplay = '0:00';
+      return;
+    }
+    const tick = () => {
+      const elapsed = (Date.now() - joined) / 1000;
+      timeInInstanceDisplay = formatElapsed(elapsed);
+    };
+    tick(); // immediate update
+    timeInInstanceInterval = setInterval(tick, 1000);
+    return () => {
+      if (timeInInstanceInterval) {
+        clearInterval(timeInInstanceInterval);
+        timeInInstanceInterval = null;
+      }
+    };
+  });
+
   onDestroy(() => {
     if (unlisten) {
       unlisten();
+    }
+    if (timeInInstanceInterval) {
+      clearInterval(timeInInstanceInterval);
+      timeInInstanceInterval = null;
     }
     // Clear note batch timer
     if (noteBatchTimer) {
@@ -466,6 +632,50 @@
 </script>
 
 <div class="panel">
+  <!-- Location: always visible above player list -->
+  <div class="location-card">
+    <div class="location-header">
+      <div class="location-title">{location.roomName || '—'}</div>
+      {#if instanceJoinedAt != null}
+        <span class="time-in-instance-capsule">{timeInInstanceDisplay}</span>
+      {/if}
+      <button
+        class="stopwatch-btn"
+        title="Instance history"
+        aria-label="Instance history"
+        onclick={async () => {
+          showHistoryModal = true;
+          try {
+            const hist = await invoke('get_instance_history') as any[];
+            instanceHistory = Array.isArray(hist) ? hist : [];
+          } catch (err) {
+            console.error('Failed to load instance history:', err);
+            instanceHistory = [];
+          }
+        }}
+      >
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="12" cy="13" r="8" stroke="currentColor" stroke-width="1.5"/>
+          <path d="M12 9v4l3 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          <path d="M12 5V3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          <path d="M12 21v-2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          <path d="M16 5l1.5-1.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          <path d="M6.5 15.5L5 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          <circle cx="12" cy="7" r="1.5" fill="currentColor"/>
+        </svg>
+      </button>
+    </div>
+    <div class="location-subtext">
+      {#if location.worldId || location.instanceId}
+        World ID: {location.worldId || '—'}
+        <br />
+        Instance ID: {location.instanceId || '—'}
+      {:else}
+        —
+      {/if}
+    </div>
+  </div>
+
   <div class="header">
     <div class="meta">{activeUsers.length} user{activeUsers.length === 1 ? '' : 's'} in instance</div>
   </div>
@@ -658,12 +868,120 @@
   </div>
 {/if}
 
+{#if showHistoryModal}
+  <div
+    class="modal-backdrop history-modal-backdrop"
+    role="button"
+    tabindex="0"
+    onclick={(e) => { if (e.target === e.currentTarget) showHistoryModal = false; }}
+    onkeydown={(e) => { if (e.key === 'Escape') showHistoryModal = false; }}
+  >
+    <div class="modal history-modal" role="dialog">
+      <header>
+        <h3>Instance History</h3>
+        <button class="close-btn" onclick={() => showHistoryModal = false}>×</button>
+      </header>
+      <div class="history-content">
+        {#if instanceHistory.length === 0}
+          <div class="history-empty">No instance history yet.</div>
+        {:else}
+          <div class="history-list">
+            {#each instanceHistory as entry}
+              <div class="history-capsule" class:join={entry.kind === 'join'} class:leave={entry.kind === 'leave'}>
+                <span class="history-timestamp">{entry.timestamp || '—'}</span>
+                <span class="history-kind">{entry.kind === 'join' ? 'Join' : 'Leave'}</span>
+                {#if entry.kind === 'join' && (entry.room_name || entry.world_id || entry.instance_id)}
+                  <div class="history-details">
+                    {#if entry.room_name}
+                      <span class="history-room">{entry.room_name}</span>
+                    {/if}
+                    {#if entry.world_id}
+                      <span class="history-id">World: {entry.world_id}</span>
+                    {/if}
+                    {#if entry.instance_id}
+                      <span class="history-id">Instance: {entry.instance_id}</span>
+                    {/if}
+                  </div>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    </div>
+  </div>
+{/if}
+
 <style>
   .panel {
     display: flex;
     flex-direction: column;
     gap: 12px;
     height: 100%;
+  }
+
+  .location-card {
+    padding: 12px 16px;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    flex-shrink: 0;
+  }
+
+  .location-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .location-title {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--fg);
+    flex: 1;
+    min-width: 0;
+  }
+
+  .time-in-instance-capsule {
+    flex-shrink: 0;
+    padding: 4px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 600;
+    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--fg-muted);
+  }
+
+  .stopwatch-btn {
+    flex-shrink: 0;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--fg-muted);
+    border-radius: 6px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .stopwatch-btn:hover {
+    background: var(--bg-hover);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .location-subtext {
+    font-size: 12px;
+    color: var(--fg-muted);
+    margin-top: 4px;
+    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+    word-break: break-all;
   }
 
   .header {
@@ -1089,6 +1407,8 @@
     border-radius: 6px;
     font-size: 12px;
     color: var(--fg-muted);
+    white-space: pre-wrap;
+    word-break: break-word;
   }
 
   .match-meta {
@@ -1103,5 +1423,82 @@
     text-align: center;
     color: var(--fg-muted);
     font-style: italic;
+  }
+
+  /* Instance History Modal */
+  .history-content {
+    padding: 16px;
+    overflow-y: auto;
+    max-height: 60vh;
+  }
+
+  .history-empty {
+    padding: 32px;
+    text-align: center;
+    color: var(--fg-muted);
+    font-style: italic;
+  }
+
+  .history-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .history-capsule {
+    padding: 10px 14px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .history-capsule.join {
+    border-color: rgba(107, 255, 107, 0.5);
+    background: rgba(107, 255, 107, 0.08);
+  }
+
+  .history-capsule.leave {
+    border-color: rgba(255, 107, 107, 0.5);
+    background: rgba(255, 107, 107, 0.08);
+  }
+
+  .history-timestamp {
+    font-size: 12px;
+    color: var(--fg-muted);
+    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+  }
+
+  .history-kind {
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .history-capsule.join .history-kind {
+    color: #6bff6b;
+  }
+
+  .history-capsule.leave .history-kind {
+    color: #ff6b6b;
+  }
+
+  .history-details {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-top: 4px;
+    font-size: 12px;
+    color: var(--fg-muted);
+  }
+
+  .history-room {
+    font-weight: 500;
+    color: var(--fg);
+  }
+
+  .history-id {
+    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+    word-break: break-all;
   }
 </style>

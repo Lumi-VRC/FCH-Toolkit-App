@@ -5,7 +5,7 @@
   import { open } from '@tauri-apps/plugin-shell';
   import { listen } from '@tauri-apps/api/event';
 
-  let { collapsed = false, activeIndex = 0, onToggle = () => {}, onSelect = (_) => {} } = $props();
+let { collapsed = false, activeIndex = 0, onToggle = () => {}, onSelect = (_) => {} } = $props();
 
   const labels = [
     'Login', 'Instance Monitor', 'Database', 'Log Explorer', 'World Moderation', 'Settings', 'Debug', 'About'

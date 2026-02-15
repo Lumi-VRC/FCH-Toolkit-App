@@ -1,6 +1,6 @@
 [package]
 name = "fchapp"
-version = "2.1.0"
+version = "2.2.1"
 description = "FCH App desktop shell"
 authors = ["FCH Team"]
 edition = "2021"

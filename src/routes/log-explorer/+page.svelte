@@ -152,6 +152,7 @@
   }
 
   async function openMostRecentLogFile() {
+    if (!mostRecentLogFile) return;
     try {
       console.log('Attempting to open most recent log file...');
       const result = await invoke('open_most_recent_log_file');
@@ -159,6 +160,16 @@
     } catch (err) {
       console.error('Failed to open log file:', err);
       alert(`Failed to open log file: ${err}`);
+    }
+  }
+
+  async function openMostRecentLogFolder() {
+    try {
+      const result = await invoke('open_most_recent_log_folder');
+      console.log('Open folder result:', result);
+    } catch (err) {
+      console.error('Failed to open log folder:', err);
+      alert(`Failed to open log folder: ${err}`);
     }
   }
 
@@ -355,13 +366,18 @@
     </label>
     <button 
       class="control-btn" 
-      onclick={() => {
-        console.log('Button clicked, mostRecentLogFile:', mostRecentLogFile);
-        openMostRecentLogFile();
-      }}
+      onclick={openMostRecentLogFile}
       title={mostRecentLogFile ? `Open: ${mostRecentLogFile.split(/[/\\]/).pop()}` : 'No log file available'}
+      disabled={!mostRecentLogFile}
     >
       Open Log File
+    </button>
+    <button
+      class="control-btn"
+      onclick={openMostRecentLogFolder}
+      title="Open VRChat log folder"
+    >
+      Open Log Folder
     </button>
     <span class="status">Running • {logLines.length} lines</span>
   </div>
@@ -437,6 +453,14 @@
   .control-btn:hover {
     background: var(--bg-hover);
     border-color: var(--accent);
+  }
+
+  .control-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    background: var(--bg);
+    border-color: var(--border);
+    color: var(--fg-muted);
   }
   
   .auto-scroll-label {
